@@ -10,7 +10,7 @@ import { setupSwagger } from './swagger/swagger.setup';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const configService = app.get(ConfigService);
-  const port = configService.get<number>('PORT') ?? 3000;
+  const port = configService.get<number>('PORT') ?? 3200;
   app.enableCors({ origin: '*' });
   app.useGlobalPipes(new ValidationPipe({ transform: true, whitelist: true, forbidNonWhitelisted: true, }),);
   app.enableCors();
