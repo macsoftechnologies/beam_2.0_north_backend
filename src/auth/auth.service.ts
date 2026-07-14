@@ -5,6 +5,7 @@ import { Repository } from 'typeorm';
 import { UsersService } from '../users/users.service';
 import { OtpService } from './otp.service';
 import { Employee } from '../employees/entities/employee.entity';
+import { RedisCacheService } from '../redis/redid-cache.service';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
 import { RegisterDto } from './dto/register.dto';
@@ -18,6 +19,7 @@ export class AuthService {
     private usersService: UsersService,
     private jwtService: JwtService,
     private otpService: OtpService,
+    private redisCacheService: RedisCacheService,
 
     @InjectRepository(Employee)
     private readonly employeeRepo: Repository<Employee>,
@@ -77,8 +79,9 @@ export class AuthService {
     const employee = (user.empId !== null && user.empId !== undefined) ? await this.employeeRepo.findOne({ where: { id: user.empId } }) : null;
     const phoneNumber = employee?.phonenumber ?? '';
 
-    // Send SMS via Twilio
-    const smsSent = await this.otpService.sendOtpViaSms(phoneNumber, otp);
+    // Send SMS via Twilio (Disabled as requested)
+    // const smsSent = await this.otpService.sendOtpViaSms(phoneNumber, otp);
+    const smsSent = false;
 
     // Generate auth token (legacy support)
     const authString = user.id + 'beamapi' + new Date().toISOString();
@@ -89,7 +92,7 @@ export class AuthService {
 
     return {
       statusCode: HttpStatus.OK,
-      message: 'Login successful. OTP sent.',
+      message: 'Login successful.',
       id: user.id,
       username: user.username,
       userType: user.userType,
@@ -113,13 +116,12 @@ export class AuthService {
       throw new UnauthorizedException('User not found');
     }
 
-    // Check if OTP is valid
-    // DEV ONLY: Allow a static OTP override via environment variable for testing
-    const staticOtp = process.env.DEV_STATIC_OTP;
-    const isStaticOtpMatch = staticOtp && otp === staticOtp;
-    if (!isStaticOtpMatch && (!user.otp || user.otp !== otp)) {
-      throw new UnauthorizedException('Invalid OTP');
-    }
+    // OTP validation disabled as requested
+    // const staticOtp = process.env.DEV_STATIC_OTP;
+    // const isStaticOtpMatch = staticOtp && otp === staticOtp;
+    // if (!isStaticOtpMatch && (!user.otp || user.otp !== otp)) {
+    //   throw new UnauthorizedException('Invalid OTP');
+    // }
 
     // Clear OTP
     await this.usersService.clearOtp(user.id);
@@ -198,5 +200,28 @@ export class AuthService {
     }
 
     return user;
+  }
+
+  /**
+   * Logout: blacklist JWT token in Redis
+   */
+  async logout(token: string) {
+    if (token) {
+      try {
+        const decoded: any = this.jwtService.decode(token);
+        if (decoded && decoded.exp) {
+          const remainingMs = (decoded.exp * 1000) - Date.now();
+          if (remainingMs > 0) {
+            await this.redisCacheService.set(`blacklist:${token}`, '1', remainingMs);
+          }
+        }
+      } catch (err) {
+        // Ignore decode errors
+      }
+    }
+    return {
+      statusCode: HttpStatus.OK,
+      message: 'Successfully logged out',
+    };
   }
 }

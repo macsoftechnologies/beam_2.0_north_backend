@@ -153,6 +153,15 @@ export class RequestsService {
     return String(val1).trim() === String(val2).trim();
   }
 
+  async getSubcontractorIdForUser(userId?: number): Promise<number | null> {
+    if (!userId) return null;
+    const user = await this.userRepo.findOne({ where: { id: userId } });
+    if (user && user.userType === 'Subcontractor') {
+      return user.typeId;
+    }
+    return null;
+  }
+
   private async validateStatusTransitionAndRole(
     existing: RequestEntity,
     newStatus: string,
@@ -792,7 +801,12 @@ export class RequestsService {
   }
 
   // Update Request
-  async update(id: number, dto: UpdateRequestDto, files?: any[]): Promise<any> {
+  async update(
+    id: number,
+    dto: UpdateRequestDto,
+    files?: any[],
+    images?: any[],
+  ): Promise<any> {
     const existing = await this.requestRepo.findOne({ where: { id } });
     if (!existing) {
       throw new BadRequestException('Request not found');
@@ -844,15 +858,35 @@ export class RequestsService {
 
     // Validate status transition
     const currentStatus = (existing.requestStatus || '').toLowerCase().trim();
-    let newStatus = '';
-    if (dto.Request_status !== undefined && dto.Request_status !== '') {
-      newStatus = dto.Request_status.toLowerCase().trim();
-    } else if (dto.status !== undefined) {
-      newStatus = dto.status === 1 ? 'pending' : 'cancelled'; // map basic integer status if needed
-    }
+    let isStatusChanged = false;
+    let finalRequestStatusForLog = 'Edited';
 
-    if (newStatus !== '' && newStatus !== currentStatus) {
-      await this.validateStatusTransitionAndRole(existing, newStatus, dto.userId ?? 0);
+    if (dto.Request_status !== undefined && dto.Request_status !== '') {
+      const normalizedNew = dto.Request_status.toLowerCase().trim();
+      if (normalizedNew !== currentStatus) {
+        try {
+          await this.validateStatusTransitionAndRole(existing, normalizedNew, dto.userId ?? 0);
+          isStatusChanged = true;
+          finalRequestStatusForLog = dto.Request_status;
+        } catch (error) {
+          // If the status transition is invalid (e.g. trying to revert Approved to Draft during edit),
+          // we silently ignore the status change and do NOT update requestStatus in the requests table.
+          isStatusChanged = false;
+          finalRequestStatusForLog = 'Edited';
+        }
+      }
+    } else if (dto.status !== undefined) {
+      const normalizedNew = dto.status === 1 ? 'pending' : 'cancelled';
+      if (normalizedNew !== currentStatus) {
+        try {
+          await this.validateStatusTransitionAndRole(existing, normalizedNew, dto.userId ?? 0);
+          isStatusChanged = true;
+          finalRequestStatusForLog = dto.status === 1 ? 'Pending' : 'Cancelled';
+        } catch (error) {
+          isStatusChanged = false;
+          finalRequestStatusForLog = 'Edited';
+        }
+      }
     }
 
     // Compare and build fieldChanges
@@ -1521,8 +1555,13 @@ export class RequestsService {
     addIfChanged('badgeNumbers', dto.Badge_Numbers, existing.badgeNumbers);
     addIfChanged('teamId', dto.teamId, existing.teamId);
     addIfChanged('notes', dto.notes, existing.notes);
-    addIfChanged('requestStatus', dto.Request_status, existing.requestStatus);
-    addIfChanged('status', dto.status, existing.status);
+    if (isStatusChanged) {
+      if (dto.Request_status !== undefined && dto.Request_status !== '') {
+        addIfChanged('requestStatus', dto.Request_status, existing.requestStatus);
+      } else if (dto.status !== undefined) {
+        addIfChanged('status', dto.status, existing.status);
+      }
+    }
     addIfChanged('permitType', dto.permit_type, existing.permitType);
     addIfChanged('permitUnder', dto.permit_under, existing.permitUnder);
     addIfChanged('newDate', dto.new_date, existing.newDate);
@@ -1546,15 +1585,24 @@ export class RequestsService {
     ) => {
       const filteredFields: any = {};
       for (const key in fields) {
-        if (
-          fields[key] !== undefined &&
-          !this.areEqual(existingSub?.[key], fields[key])
-        ) {
+        if (fields[key] !== undefined) {
           filteredFields[key] = fields[key];
         }
       }
       if (Object.keys(filteredFields).length > 0) {
-        await repo.update({ requestId: id }, filteredFields);
+        if (existingSub) {
+          const changedFields: any = {};
+          for (const key in filteredFields) {
+            if (!this.areEqual(existingSub[key], filteredFields[key])) {
+              changedFields[key] = filteredFields[key];
+            }
+          }
+          if (Object.keys(changedFields).length > 0) {
+            await repo.update({ requestId: id }, changedFields);
+          }
+        } else {
+          await repo.save(repo.create({ requestId: id, ...filteredFields }));
+        }
       }
     };
 
@@ -1710,7 +1758,7 @@ export class RequestsService {
       specificRisks: dto.specific_risks,
       environmentEnsured: dto.environment_ensured,
       courseOfActions:
-        dto.course_of_actions !== undefined
+        dto.course_of_actions !== undefined && dto.course_of_actions !== null
           ? dto.course_of_actions
           : dto.course_of_action,
     });
@@ -1785,28 +1833,55 @@ export class RequestsService {
       }
     }
 
-    // Save base64 image if passed
-    if (dto.Image1) {
-      const encodedString = dto.Image1.split(',');
-      const base64Data = encodedString[1] || encodedString[0];
-      if (base64Data) {
-        const buffer = Buffer.from(base64Data, 'base64');
-        const filename = `${Date.now()}_${Math.round(Math.random() * 1e9)}.png`;
-        const uploadDir = './uploads/requests';
-        if (!fs.existsSync(uploadDir)) {
-          fs.mkdirSync(uploadDir, { recursive: true });
-        }
-        const filePath = path.join(uploadDir, filename);
-        fs.writeFileSync(filePath, buffer);
-
-        // insert record into uploadimage table
+    // Save uploaded images (multer)
+    if (images && images.length > 0) {
+      for (const file of images) {
         await this.uploadImageRepo.save(
           this.uploadImageRepo.create({
             requestId: id,
-            imageName: filePath.replace(/\\/g, '/'),
+            imageName: file.path.replace(/\\/g, '/'),
             userId: dto.userId || existing.userId || 0,
           }),
         );
+      }
+    }
+
+    // Save base64 images if passed (accepts single base64 string or JSON array of base64 strings)
+    if (dto.Image1) {
+      let base64Array: string[] = [];
+      try {
+        if (typeof dto.Image1 === 'string' && dto.Image1.trim().startsWith('[')) {
+          base64Array = JSON.parse(dto.Image1);
+        } else {
+          base64Array = [dto.Image1];
+        }
+      } catch (e) {
+        base64Array = [dto.Image1];
+      }
+
+      for (const imgStr of base64Array) {
+        if (!imgStr) continue;
+        const encodedString = imgStr.split(',');
+        const base64Data = encodedString[1] || encodedString[0];
+        if (base64Data) {
+          const buffer = Buffer.from(base64Data, 'base64');
+          const filename = `${Date.now()}_${Math.round(Math.random() * 1e9)}.png`;
+          const uploadDir = './uploads/requests';
+          if (!fs.existsSync(uploadDir)) {
+            fs.mkdirSync(uploadDir, { recursive: true });
+          }
+          const filePath = path.join(uploadDir, filename);
+          fs.writeFileSync(filePath, buffer);
+
+          // insert record into uploadimage table
+          await this.uploadImageRepo.save(
+            this.uploadImageRepo.create({
+              requestId: id,
+              imageName: filePath.replace(/\\/g, '/'),
+              userId: dto.userId || existing.userId || 0,
+            }),
+          );
+        }
       }
     }
 
@@ -1819,7 +1894,7 @@ export class RequestsService {
     await this.createLogs(
       id,
       dto.userId || existing.userId || 0,
-      dto.Request_status || existing.requestStatus || 'Updated',
+      finalRequestStatusForLog,
       new Date(),
       finalChanges,
       0,
@@ -1834,13 +1909,45 @@ export class RequestsService {
   }
 
   // Bulk Status Update
+  private getNextDateString(dateStr: string | Date): string | null {
+    if (!dateStr) return null;
+    const dateStrNorm = typeof dateStr === 'object' ? dateStr.toISOString().split('T')[0] : String(dateStr);
+    const parts = dateStrNorm.split('-');
+    if (parts.length !== 3) return null;
+    const y = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10) - 1;
+    const d = parseInt(parts[2], 10);
+
+    const dateObj = new Date(y, m, d);
+    dateObj.setDate(dateObj.getDate() + 1);
+
+    const nextY = dateObj.getFullYear();
+    const nextM = String(dateObj.getMonth() + 1).padStart(2, '0');
+    const nextD = String(dateObj.getDate()).padStart(2, '0');
+    return `${nextY}-${nextM}-${nextD}`;
+  }
+
   async updateStatus(body: {
     id: string;
     Request_status?: string;
     status?: number;
     userId?: number;
+    Start_Time?: string;
+    End_Time?: string;
+    night_shift?: number;
+    new_end_time?: string;
   }): Promise<any> {
-    const { id, Request_status, status, userId } = body;
+    const {
+      id,
+      Request_status,
+      status,
+      userId,
+      Start_Time,
+      End_Time,
+      night_shift,
+      new_end_time,
+    } = body;
+
     if (!id) {
       throw new BadRequestException('Missing required field: id');
     }
@@ -1850,58 +1957,168 @@ export class RequestsService {
       .map((val) => Number(val.trim()))
       .filter((val) => !isNaN(val));
 
-    // 1. Pre-validate all updates to fail-fast before database write
-    const requestsToUpdate: RequestEntity[] = [];
+    const successfulUpdates: number[] = [];
+    const failedUpdates: { id: number; error: string }[] = [];
+
+    // Resolve the incoming status to the actual stored value
+    const resolvedStatus = this.resolveApprovalStatus(Request_status);
+
     for (const singleId of idsArray) {
       const existing = await this.requestRepo.findOne({
         where: { id: singleId },
       });
       if (!existing) {
-        throw new BadRequestException(`Request with ID ${singleId} not found`);
+        failedUpdates.push({ id: singleId, error: 'Request not found' });
+        continue;
       }
-      requestsToUpdate.push(existing);
-
-      let targetStatus = '';
-      if (Request_status !== undefined) {
-        targetStatus = Request_status;
-      } else if (status !== undefined) {
-        targetStatus = status === 1 ? 'Pending' : 'Cancelled';
+      const statusLower = existing.requestStatus?.toLowerCase() || '';
+      if (
+        statusLower === 'rejected' ||
+        statusLower === 'cancelled' ||
+        statusLower === 'closed' ||
+        statusLower === 'auto-cancelled' ||
+        statusLower === 'auto cancelled'
+      ) {
+        failedUpdates.push({
+          id: singleId,
+          error: `Permit is in '${existing.requestStatus}' status and cannot be modified.`,
+        });
+        continue;
       }
 
-      if (targetStatus !== '') {
-        await this.validateStatusTransitionAndRole(existing, targetStatus, userId || 0);
+      try {
+        const updateData: Partial<RequestEntity> = {};
+
+        // 1. Process Status transition if requested
+        let targetStatus = '';
+        if (Request_status !== undefined) {
+          targetStatus = Request_status;
+        } else if (status !== undefined) {
+          targetStatus = status === 1 ? 'Pending' : 'Cancelled';
+        }
+
+        if (targetStatus !== '') {
+          await this.validateStatusTransitionAndRole(existing, targetStatus, userId || 0);
+          if (Request_status !== undefined) {
+            updateData.requestStatus = resolvedStatus;
+          }
+          if (status !== undefined) {
+            updateData.status = status;
+          }
+        }
+
+        // 2. Process Shift & Timing bulk edit if requested
+        const isTimeUpdate = Start_Time !== undefined || End_Time !== undefined || night_shift !== undefined || new_end_time !== undefined;
+        if (isTimeUpdate) {
+          let effectiveStartTime = Start_Time !== undefined && Start_Time !== "" ? Start_Time : existing.startTime;
+          let effectiveEndTime = End_Time !== undefined && End_Time !== "" ? End_Time : existing.endTime;
+
+          if (night_shift === 1) {
+            const valNewEndTime = new_end_time !== undefined && new_end_time !== "" ? new_end_time : existing.newEndTime;
+            if (valNewEndTime) {
+              if (effectiveStartTime && valNewEndTime >= effectiveStartTime) {
+                throw new BadRequestException('For night shift, new end time must be earlier than start time.');
+              }
+            }
+            updateData.nightShift = '1';
+            updateData.endTime = '23:59';
+            if (existing.workingDate) {
+              const nextDate = this.getNextDateString(existing.workingDate);
+              if (nextDate) {
+                updateData.newDate = nextDate;
+              }
+            }
+            if (new_end_time !== undefined) {
+              updateData.newEndTime = new_end_time;
+            }
+          } else if (night_shift === 0) {
+            if (effectiveStartTime && effectiveEndTime) {
+              if (effectiveStartTime >= effectiveEndTime) {
+                throw new BadRequestException('Start time must be earlier than End time.');
+              }
+            }
+            updateData.nightShift = '0';
+            if (End_Time !== undefined) {
+              updateData.endTime = End_Time;
+            }
+            updateData.newDate = null as any;
+            updateData.newEndTime = null as any;
+          } else {
+            // night_shift is not being changed, just updating start/end times
+            const currentNightShift = existing.nightShift === '1';
+            if (currentNightShift) {
+              const valNewEndTime = new_end_time !== undefined && new_end_time !== "" ? new_end_time : existing.newEndTime;
+              if (valNewEndTime) {
+                if (effectiveStartTime && valNewEndTime >= effectiveStartTime) {
+                  throw new BadRequestException('For night shift, new end time must be earlier than start time.');
+                }
+              }
+              updateData.endTime = '23:59';
+              if (new_end_time !== undefined) {
+                updateData.newEndTime = new_end_time;
+              }
+            } else {
+              if (effectiveStartTime && effectiveEndTime) {
+                if (effectiveStartTime >= effectiveEndTime) {
+                  throw new BadRequestException('Start time must be earlier than End time.');
+                }
+              }
+              if (End_Time !== undefined) {
+                updateData.endTime = End_Time;
+              }
+            }
+          }
+
+          if (Start_Time !== undefined) {
+            updateData.startTime = Start_Time;
+          }
+        }
+
+        // Apply update to DB if there's any data to change
+        if (Object.keys(updateData).length > 0) {
+          await this.requestRepo.update(existing.id, updateData);
+        }
+
+        // Create log if status changed
+        if (targetStatus !== '') {
+          await this.createLogs(
+            existing.id,
+            userId || 0,
+            resolvedStatus || (status === 1 ? 'Pending' : 'Cancelled'),
+            new Date(),
+            [],
+            0,
+          );
+        } else if (isTimeUpdate) {
+          await this.createLogs(
+            existing.id,
+            userId || 0,
+            existing.requestStatus || 'Updated',
+            new Date(),
+            [],
+            0,
+          );
+        }
+
+        successfulUpdates.push(existing.id);
+      } catch (err: any) {
+        failedUpdates.push({
+          id: existing.id,
+          error: err.message || 'Update failed validation',
+        });
       }
-    }
-
-    // 2. Resolve the incoming status to the actual stored value
-    //    CONM-*/COMM-* are UI-only prefixes that encode which approval stream is acting
-    const resolvedStatus = this.resolveApprovalStatus(Request_status);
-
-    // 3. Perform updates
-    for (const existing of requestsToUpdate) {
-      const updateData: Partial<RequestEntity> = {};
-      if (Request_status !== undefined)
-        updateData.requestStatus = resolvedStatus;
-      if (status !== undefined) updateData.status = status;
-
-      await this.requestRepo.update(existing.id, updateData);
-
-      // Create log with the resolved status
-      await this.createLogs(
-        existing.id,
-        userId || 0,
-        resolvedStatus || (status === 1 ? 'Pending' : 'Cancelled'),
-        new Date(),
-        [],
-        0,
-      );
     }
 
     await this.redisCacheService.deleteByPattern('requests:*');
 
+    const message = `Successfully updated permits: [${successfulUpdates.join(', ')}].` + 
+      (failedUpdates.length > 0 ? ` Failed/Skipped: ${failedUpdates.map((f) => `ID ${f.id} (${f.error})`).join('; ')}` : '');
+
     return {
-      status: 200,
-      message: 'Request Updated',
+      status: failedUpdates.length === idsArray.length ? 500 : 200,
+      message,
+      successfulIds: successfulUpdates,
+      failed: failedUpdates,
     };
   }
 
@@ -1993,30 +2210,45 @@ export class RequestsService {
       roomIdOrName.trim() === '0'
     )
       return null;
-    const term = roomIdOrName.trim();
-    const terms: Set<string> = new Set([term]); // Always include the raw value as a search term
 
-    if (/^\d+$/.test(term)) {
-      // Numeric input – look up the room name so we can also match by name
-      const room = await this.roomRepo.findOne({
-        where: { room_id: Number(term) },
-      });
-      if (room) terms.add(room.room_name);
-    } else {
-      // Name input – look up matching rooms so we can also match stored IDs
-      const rooms = await this.roomRepo
-        .createQueryBuilder('r')
-        .where('r.room_name LIKE :name', { name: `%${term}%` })
-        .getMany();
-      rooms.forEach((r) => terms.add(String(r.room_id)));
+    const parts = roomIdOrName.split(',').map((p) => p.trim()).filter(Boolean);
+    if (parts.length === 0) return null;
+
+    const terms: Set<string> = new Set();
+
+    for (const part of parts) {
+      terms.add(part); // Always include the raw part
+      if (/^\d+$/.test(part)) {
+        // Numeric input – look up the room name so we can also match by name
+        const room = await this.roomRepo.findOne({
+          where: { room_id: Number(part) },
+        });
+        if (room) {
+          terms.add(room.room_name);
+        }
+      } else {
+        // Name input – look up matching rooms so we can also match stored IDs
+        const rooms = await this.roomRepo
+          .createQueryBuilder('r')
+          .where('r.room_name LIKE :name', { name: `%${part}%` })
+          .getMany();
+        rooms.forEach((r) => {
+          terms.add(String(r.room_id));
+          terms.add(r.room_name);
+        });
+      }
     }
+
     return [...terms];
   }
 
 
   // Search/Filter Requests
-  async search(dto: SearchRequestDto): Promise<any> {
-    const key = `requests:search:${JSON.stringify(dto)}`;
+  async search(dto: SearchRequestDto, loggedInUserId?: number): Promise<any> {
+    const subContractorId = await this.getSubcontractorIdForUser(loggedInUserId);
+    const key = subContractorId
+      ? `requests:search:${JSON.stringify(dto)}:subcon:${subContractorId}`
+      : `requests:search:${JSON.stringify(dto)}`;
     return this.redisCacheService.getOrSet(
       key,
       async () => {
@@ -2167,22 +2399,30 @@ export class RequestsService {
           });
         }
         if (dto.Request_status) {
-          if (dto.Request_status === 'Auto-Cancelled') {
-            qb.andWhere('extraMisc.cancelReason = :cancelReason', {
-              cancelReason: 'Permit not opened so system cancelled automatically',
+          const statusList = dto.Request_status.split(',').map(s => s.trim());
+          if (statusList.length > 1) {
+            qb.andWhere('requests.Request_status IN (:...requestStatuses)', {
+              requestStatuses: statusList,
             });
-          } else if (dto.Request_status === 'Cancelled') {
-            qb.andWhere('requests.Request_status = :requestStatus', {
-              requestStatus: dto.Request_status,
-            });
-            qb.andWhere(
-              '(extraMisc.cancelReason IS NULL OR extraMisc.cancelReason != :autoCancelMsg)',
-              { autoCancelMsg: 'Permit not opened so system cancelled automatically' },
-            );
           } else {
-            qb.andWhere('requests.Request_status = :requestStatus', {
-              requestStatus: dto.Request_status,
-            });
+            const singleStatus = statusList[0];
+            if (singleStatus === 'Auto-Cancelled') {
+              qb.andWhere('extraMisc.cancelReason = :cancelReason', {
+                cancelReason: 'Permit not opened so system cancelled automatically',
+              });
+            } else if (singleStatus === 'Cancelled') {
+              qb.andWhere('requests.Request_status = :requestStatus', {
+                requestStatus: singleStatus,
+              });
+              qb.andWhere(
+                '(extraMisc.cancelReason IS NULL OR extraMisc.cancelReason != :autoCancelMsg)',
+                { autoCancelMsg: 'Permit not opened so system cancelled automatically' },
+              );
+            } else {
+              qb.andWhere('requests.Request_status = :requestStatus', {
+                requestStatus: singleStatus,
+              });
+            }
           }
         }
         if (
@@ -2324,11 +2564,22 @@ export class RequestsService {
           });
         }
 
-        // Role filters (from PHP)
-        if (dto.LoginType === 'Subcontractor' && dto.user_id) {
-          qb.andWhere('requests.userId = :userIdFilter', {
-            userIdFilter: dto.user_id,
+        // Role filters
+        if (subContractorId) {
+          qb.andWhere('requests.Sub_Contractor_Id = :subContractorIdFilter', {
+            subContractorIdFilter: subContractorId,
           });
+        } else if (dto.LoginType === 'Subcontractor' && dto.user_id) {
+          const user = await this.userRepo.findOne({ where: { id: dto.user_id } });
+          if (user && user.userType === 'Subcontractor') {
+            qb.andWhere('requests.Sub_Contractor_Id = :subContractorIdFilter', {
+              subContractorIdFilter: user.typeId,
+            });
+          } else {
+            qb.andWhere('requests.userId = :userIdFilter', {
+              userIdFilter: dto.user_id,
+            });
+          }
         }
 
         // Safety Flag Filters (requires joining sub-tables) - only filter when explicitly set to 1
@@ -2501,7 +2752,7 @@ export class RequestsService {
             Zone_Id: req.zoneId || '',
             zone_name: (req as any).zone?.zone || '',
             zone: req.zone || '',
-            Room_Nos: req.roomNos || '',
+            Room_Nos: resolvedRooms || '',
             room_names: resolvedRooms,
             Room_Type: req.roomType || '',
             Number_Of_Workers: req.numberOfWorkers || '',
@@ -2512,7 +2763,7 @@ export class RequestsService {
             status: req.status,
             createdTime: req.createdTime || '',
             Site_Id: req.siteId,
-            permit_type: req.permitType || '',
+            permit_type: req.permitType || 'Construction',
             permit_under: req.permitUnder || 'Construction',
             new_date: req.newDate || '',
             new_end_time: req.newEndTime || '',
@@ -2546,6 +2797,10 @@ export class RequestsService {
           mergeSub((req as any).ppe, this.ppeRepo);
           mergeSub((req as any).pressureTesting, this.pressureTestingRepo);
 
+          if (flatObj.course_of_actions !== undefined) {
+            flatObj.course_of_action = flatObj.course_of_actions;
+          }
+
           // Fetch files & notes
           const files = await this.ramsFileRepo.find({
             where: { requestId: req.id, status: 1 },
@@ -2566,9 +2821,16 @@ export class RequestsService {
         }
 
         // Subcontractors and Activities lists
-        const subcontractors = await this.subcontractorRepo.find({
-          order: { subContractorName: 'ASC' },
-        });
+        let subcontractors;
+        if (subContractorId) {
+          subcontractors = await this.subcontractorRepo.find({
+            where: { id: subContractorId },
+          });
+        } else {
+          subcontractors = await this.subcontractorRepo.find({
+            order: { subContractorName: 'ASC' },
+          });
+        }
         const activities = await this.activityRepo.find({
           order: { activityName: 'ASC' },
         });
@@ -2585,8 +2847,52 @@ export class RequestsService {
     );
   }
 
-  async plansList(searchDto: PlanSearchDto): Promise<any> {
-    const key = `requests:plans:${JSON.stringify(searchDto)}`;
+  async plansList(searchDto: PlanSearchDto, loggedInUserId?: number): Promise<any> {
+    const allowedKeys: (keyof PlanSearchDto)[] = [
+      'Date', 'Week', 'Year', 'Month', 'Site_Id', 'Building_Id', 'Sub_Contractor_Id',
+      'Room_Type', 'from_date', 'to_date', 'start_time', 'end_time', 'area',
+      'permit_type', 'permit_under', 'night_shift', 'new_date', 'new_end_time',
+      'hras', 'Request_status', 'Hot_work', 'working_on_electrical_system',
+      'working_hazardious_substen', 'using_cranes_or_lifting',
+      'pressure_tesing_of_equipment', 'working_at_height', 'working_confined_spaces',
+      'work_in_atex_area', 'securing_facilities', 'excavation_works',
+      'specific_gloves', 'eye_protection', 'fall_protection', 'hearing_protection',
+      'respiratory_protection', 'taskSpecificPPE', 'power_on', 'pressurization',
+      'fromDate', 'toDate', 'Start_Time', 'End_Time'
+    ];
+    const filteredSearchDto: PlanSearchDto = {};
+    for (const key of allowedKeys) {
+      if (searchDto && searchDto[key] !== undefined) {
+        filteredSearchDto[key] = searchDto[key] as any;
+      }
+    }
+
+    // Map alternate frontend keys to canonical DB query keys if provided
+    if (filteredSearchDto.fromDate && !filteredSearchDto.from_date) {
+      filteredSearchDto.from_date = filteredSearchDto.fromDate;
+    }
+    if (filteredSearchDto.toDate && !filteredSearchDto.to_date) {
+      filteredSearchDto.to_date = filteredSearchDto.toDate;
+    }
+    if (filteredSearchDto.Start_Time && !filteredSearchDto.start_time) {
+      filteredSearchDto.start_time = filteredSearchDto.Start_Time;
+    }
+    if (filteredSearchDto.End_Time && !filteredSearchDto.end_time) {
+      filteredSearchDto.end_time = filteredSearchDto.End_Time;
+    }
+
+    // Delete alternate keys to maintain Redis key serialization consistency
+    delete filteredSearchDto.fromDate;
+    delete filteredSearchDto.toDate;
+    delete filteredSearchDto.Start_Time;
+    delete filteredSearchDto.End_Time;
+
+    searchDto = filteredSearchDto;
+
+    const subContractorId = await this.getSubcontractorIdForUser(loggedInUserId);
+    const key = subContractorId
+      ? `requests:plans:${JSON.stringify(searchDto)}:subcon:${subContractorId}`
+      : `requests:plans:${JSON.stringify(searchDto)}`;
     return this.redisCacheService.getOrSet(
       key,
       async () => {
@@ -2660,7 +2966,9 @@ export class RequestsService {
         if (searchDto.Building_Id && Number(searchDto.Building_Id) !== 0) {
           qb.andWhere('requests.Building_Id = :buildingId', { buildingId: searchDto.Building_Id });
         }
-        if (searchDto.Sub_Contractor_Id && Number(searchDto.Sub_Contractor_Id) !== 0) {
+        if (subContractorId) {
+          qb.andWhere('requests.Sub_Contractor_Id = :subContractorId', { subContractorId });
+        } else if (searchDto.Sub_Contractor_Id && Number(searchDto.Sub_Contractor_Id) !== 0) {
           qb.andWhere('requests.Sub_Contractor_Id = :subContractorId', { subContractorId: searchDto.Sub_Contractor_Id });
         }
         if (searchDto.Room_Type) {
@@ -2694,18 +3002,26 @@ export class RequestsService {
           qb.andWhere('requests.hras = :hras', { hras: searchDto.hras });
         }
         if (searchDto.Request_status) {
-          if (searchDto.Request_status === 'Auto-Cancelled') {
-            qb.andWhere('extraMisc.cancelReason = :cancelReason', {
-              cancelReason: 'Permit not opened so system cancelled automatically',
+          const statusList = searchDto.Request_status.split(',').map(s => s.trim());
+          if (statusList.length > 1) {
+            qb.andWhere('requests.Request_status IN (:...requestStatuses)', {
+              requestStatuses: statusList,
             });
-          } else if (searchDto.Request_status === 'Cancelled') {
-            qb.andWhere('requests.Request_status = :requestStatus', { requestStatus: searchDto.Request_status });
-            qb.andWhere(
-              '(extraMisc.cancelReason IS NULL OR extraMisc.cancelReason != :autoCancelMsg)',
-              { autoCancelMsg: 'Permit not opened so system cancelled automatically' },
-            );
           } else {
-            qb.andWhere('requests.Request_status = :requestStatus', { requestStatus: searchDto.Request_status });
+            const singleStatus = statusList[0];
+            if (singleStatus === 'Auto-Cancelled') {
+              qb.andWhere('extraMisc.cancelReason = :cancelReason', {
+                cancelReason: 'Permit not opened so system cancelled automatically',
+              });
+            } else if (singleStatus === 'Cancelled') {
+              qb.andWhere('requests.Request_status = :requestStatus', { requestStatus: singleStatus });
+              qb.andWhere(
+                '(extraMisc.cancelReason IS NULL OR extraMisc.cancelReason != :autoCancelMsg)',
+                { autoCancelMsg: 'Permit not opened so system cancelled automatically' },
+              );
+            } else {
+              qb.andWhere('requests.Request_status = :requestStatus', { requestStatus: singleStatus });
+            }
           }
         }
 
@@ -2790,7 +3106,7 @@ export class RequestsService {
             Zone_Id: req.zoneId || '',
             zone_name: (req as any).zone?.zone || '',
             zone: req.zone || '',
-            Room_Nos: req.roomNos || '',
+            Room_Nos: resolvedRooms || '',
             room_names: resolvedRooms,
             Room_Type: req.roomType || '',
             Number_Of_Workers: req.numberOfWorkers || '',
@@ -2801,7 +3117,7 @@ export class RequestsService {
             status: req.status,
             createdTime: req.createdTime || '',
             Site_Id: req.siteId,
-            permit_type: req.permitType || '',
+            permit_type: req.permitType || 'Construction',
             permit_under: req.permitUnder || 'Construction',
             new_date: req.newDate || '',
             new_end_time: req.newEndTime || '',
@@ -2832,6 +3148,10 @@ export class RequestsService {
           mergeSub((req as any).lifting, this.liftingRepo);
           mergeSub((req as any).ppe, this.ppeRepo);
           mergeSub((req as any).pressureTesting, this.pressureTestingRepo);
+
+          if (flatObj.course_of_actions !== undefined) {
+            flatObj.course_of_action = flatObj.course_of_actions;
+          }
 
           const files = await this.ramsFileRepo.find({
             where: { requestId: req.id, status: 1 },
@@ -3085,12 +3405,18 @@ export class RequestsService {
         { id: In(ids) },
         {
           requestStatus: 'Cancelled',
-          notes: 'Permit not opened so system cancelled automatically',
         },
       );
       affected = ids.length;
 
       for (const id of ids) {
+        let ext = await this.extraMiscRepo.findOne({ where: { requestId: id } });
+        if (!ext) {
+          ext = this.extraMiscRepo.create({ requestId: id });
+        }
+        ext.cancelReason = 'Permit not opened so system cancelled automatically';
+        await this.extraMiscRepo.save(ext);
+
         const log = this.logRepo.create({
           requestId: id,
           userId: 0,
@@ -3106,11 +3432,42 @@ export class RequestsService {
   }
 
   // 11. Read counts (readCounts.php)
-  async readCounts(): Promise<any> {
+  async readCounts(loggedInUserId?: number): Promise<any> {
+    const user = loggedInUserId ? await this.userRepo.findOne({ where: { id: loggedInUserId } }) : null;
+    const userTypes = (user?.userType || '')
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean);
+
+    let subContractorId: number | null = null;
+    let limitToUserId: number | null = null;
+
+    if (user) {
+      if (userTypes.includes('Subcontractor')) {
+        subContractorId = user.typeId;
+      } else if (
+        userTypes.includes('Admin') ||
+        userTypes.includes('SuperAdmin') ||
+        userTypes.includes('Department') ||
+        userTypes.includes('Department1') ||
+        userTypes.includes('HSE')
+      ) {
+        // No filter for admin / department
+      } else {
+        limitToUserId = user.id;
+      }
+    }
+
+    const cacheKey = subContractorId
+      ? `requests:counts:subcon:${subContractorId}`
+      : limitToUserId
+      ? `requests:counts:user:${limitToUserId}`
+      : 'requests:counts';
+
     return this.redisCacheService.getOrSet(
-      'requests:counts',
+      cacheKey,
       async () => {
-        const counts = await this.requestRepo
+        const qb = this.requestRepo
           .createQueryBuilder('requests')
           .leftJoin(
             'request_extra_misc',
@@ -3119,47 +3476,54 @@ export class RequestsService {
           )
           .select('COUNT(*)', 'totalCount')
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Draft' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Draft' THEN 1 ELSE 0 END)",
             'draftCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Hold' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Hold' THEN 1 ELSE 0 END)",
             'holdCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Pre-Approved' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Pre-Approved' THEN 1 ELSE 0 END)",
             'preApprovedCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Approved' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Approved' THEN 1 ELSE 0 END)",
             'approvedCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Rejected' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Rejected' THEN 1 ELSE 0 END)",
             'rejectedCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Opened' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Opened' THEN 1 ELSE 0 END)",
             'openedCount',
           )
           .addSelect(
-            `SUM(CASE WHEN requests.requestStatus = 'Cancelled' 
+            `SUM(CASE WHEN requests.Request_status = 'Cancelled' 
             AND (rem.cancel_reason IS NULL OR rem.cancel_reason != 'Permit not opened so system cancelled automatically') 
             THEN 1 ELSE 0 END)`,
             'cancelledCount',
           )
           .addSelect(
-            `SUM(CASE WHEN requests.requestStatus = 'Cancelled' 
+            `SUM(CASE WHEN requests.Request_status = 'Cancelled' 
             AND rem.cancel_reason = 'Permit not opened so system cancelled automatically' 
             THEN 1 ELSE 0 END)`,
             'autoCancelledCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Closed' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Closed' THEN 1 ELSE 0 END)",
             'closedCount',
           )
-          .where('requests.status = 1')
-          .getRawOne();
+          .where('requests.status = 1');
+
+        if (subContractorId) {
+          qb.andWhere('requests.Sub_Contractor_Id = :subContractorId', { subContractorId });
+        } else if (limitToUserId) {
+          qb.andWhere('requests.userId = :limitToUserId', { limitToUserId });
+        }
+
+        const counts = await qb.getRawOne();
 
         return {
           data: [
@@ -3183,12 +3547,49 @@ export class RequestsService {
   }
 
   // 12. Read single status count (readRequestCount.php)
-  async readRequestCount(status: string): Promise<any> {
+  async readRequestCount(status: string, loggedInUserId?: number): Promise<any> {
+    const user = loggedInUserId ? await this.userRepo.findOne({ where: { id: loggedInUserId } }) : null;
+    const userTypes = (user?.userType || '')
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean);
+
+    let subContractorId: number | null = null;
+    let limitToUserId: number | null = null;
+
+    if (user) {
+      if (userTypes.includes('Subcontractor')) {
+        subContractorId = user.typeId;
+      } else if (
+        userTypes.includes('Admin') ||
+        userTypes.includes('SuperAdmin') ||
+        userTypes.includes('Department') ||
+        userTypes.includes('Department1') ||
+        userTypes.includes('HSE')
+      ) {
+        // No filter
+      } else {
+        limitToUserId = user.id;
+      }
+    }
+
+    const cacheKey = subContractorId
+      ? `requests:counts:${status}:subcon:${subContractorId}`
+      : limitToUserId
+      ? `requests:counts:${status}:user:${limitToUserId}`
+      : `requests:counts:${status}`;
+
     return this.redisCacheService.getOrSet(
-      `requests:counts:${status}`,
+      cacheKey,
       async () => {
+        const whereClause: any = { requestStatus: status, status: 1 };
+        if (subContractorId) {
+          whereClause.subContractorId = subContractorId;
+        } else if (limitToUserId) {
+          whereClause.userId = limitToUserId;
+        }
         const count = await this.requestRepo.count({
-          where: { requestStatus: status, status: 1 },
+          where: whereClause,
         });
         return {
           data: [
@@ -3203,7 +3604,32 @@ export class RequestsService {
   }
 
   // 13. Read Graph counts per day (readGraph.php)
-  async readGraph(WeekFirstday: string, WeekLastday: string): Promise<any> {
+  async readGraph(WeekFirstday: string, WeekLastday: string, loggedInUserId?: number): Promise<any> {
+    const user = loggedInUserId ? await this.userRepo.findOne({ where: { id: loggedInUserId } }) : null;
+    const userTypes = (user?.userType || '')
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean);
+
+    let subContractorId: number | null = null;
+    let limitToUserId: number | null = null;
+
+    if (user) {
+      if (userTypes.includes('Subcontractor')) {
+        subContractorId = user.typeId;
+      } else if (
+        userTypes.includes('Admin') ||
+        userTypes.includes('SuperAdmin') ||
+        userTypes.includes('Department') ||
+        userTypes.includes('Department1') ||
+        userTypes.includes('HSE')
+      ) {
+        // No filter
+      } else {
+        limitToUserId = user.id;
+      }
+    }
+
     const first = new Date(
       WeekFirstday.replace(' GMT+0530 (India Standard Time)', ''),
     );
@@ -3220,28 +3646,35 @@ export class RequestsService {
 
     const data: any[] = [];
     for (const d of datesList) {
-      const counts = await this.requestRepo
+      const qb = this.requestRepo
         .createQueryBuilder('requests')
         .select(
-          "SUM(CASE WHEN requests.requestStatus = 'Approved' THEN 1 ELSE 0 END)",
+          "SUM(CASE WHEN requests.Request_status = 'Approved' THEN 1 ELSE 0 END)",
           'approveCount',
         )
         .addSelect(
-          "SUM(CASE WHEN requests.requestStatus = 'Rejected' THEN 1 ELSE 0 END)",
+          "SUM(CASE WHEN requests.Request_status = 'Rejected' THEN 1 ELSE 0 END)",
           'rejectCount',
         )
         .addSelect(
-          "SUM(CASE WHEN requests.requestStatus = 'Opened' THEN 1 ELSE 0 END)",
+          "SUM(CASE WHEN requests.Request_status = 'Opened' THEN 1 ELSE 0 END)",
           'openCount',
         )
         .addSelect(
-          "SUM(CASE WHEN requests.requestStatus = 'Closed' THEN 1 ELSE 0 END)",
+          "SUM(CASE WHEN requests.Request_status = 'Closed' THEN 1 ELSE 0 END)",
           'closeCount',
         )
-        .where('requests.status = 1 AND requests.workingDate = :date', {
+        .where('requests.status = 1 AND requests.Working_Date = :date', {
           date: d,
-        })
-        .getRawOne();
+        });
+
+      if (subContractorId) {
+        qb.andWhere('requests.Sub_Contractor_Id = :subContractorId', { subContractorId });
+      } else if (limitToUserId) {
+        qb.andWhere('requests.userId = :limitToUserId', { limitToUserId });
+      }
+
+      const counts = await qb.getRawOne();
 
       const dateObj = new Date(d);
       const dayNames = [
@@ -3268,95 +3701,140 @@ export class RequestsService {
   }
 
   // 14. Read Graph Counts summary today vs week (readGraphCounts.php)
-  async readGraphCounts(): Promise<any> {
+  async readGraphCounts(loggedInUserId?: number): Promise<any> {
+    const user = loggedInUserId ? await this.userRepo.findOne({ where: { id: loggedInUserId } }) : null;
+    const userTypes = (user?.userType || '')
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean);
+
+    let subContractorId: number | null = null;
+    let limitToUserId: number | null = null;
+
+    if (user) {
+      if (userTypes.includes('Subcontractor')) {
+        subContractorId = user.typeId;
+      } else if (
+        userTypes.includes('Admin') ||
+        userTypes.includes('SuperAdmin') ||
+        userTypes.includes('Department') ||
+        userTypes.includes('Department1') ||
+        userTypes.includes('HSE')
+      ) {
+        // Admin/HSE/Department sees all
+      } else {
+        limitToUserId = user.id;
+      }
+    }
+
+    const cacheKey = subContractorId
+      ? `requests:graph:counts:subcon:${subContractorId}`
+      : limitToUserId
+      ? `requests:graph:counts:user:${limitToUserId}`
+      : 'requests:graph:counts';
+
     return this.redisCacheService.getOrSet(
-      'requests:graph:counts',
+      cacheKey,
       async () => {
-        const todayCounts = await this.requestRepo
+        const todayQb = this.requestRepo
           .createQueryBuilder('requests')
           .select('COUNT(*)', 'totalCount')
           .addSelect(
-            "SUM(CASE WHEN requests.nightShift = '1' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.night_shift = '1' THEN 1 ELSE 0 END)",
             'nightshiftCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Draft' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Draft' THEN 1 ELSE 0 END)",
             'draftCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Hold' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Hold' THEN 1 ELSE 0 END)",
             'holdCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Pre-Approved' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Pre-Approved' THEN 1 ELSE 0 END)",
             'preApprovedCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Approved' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Approved' THEN 1 ELSE 0 END)",
             'approvedCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Rejected' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Rejected' THEN 1 ELSE 0 END)",
             'rejectedCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Opened' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Opened' THEN 1 ELSE 0 END)",
             'openedCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Cancelled' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Cancelled' THEN 1 ELSE 0 END)",
             'cancelledCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Closed' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Closed' THEN 1 ELSE 0 END)",
             'closedCount',
           )
-          .where('requests.status = 1 AND requests.createdTime >= CURDATE()')
-          .getRawOne();
+          .where('requests.status = 1 AND requests.Working_Date = CURDATE()');
 
-        const lastWeekCounts = await this.requestRepo
+        if (subContractorId) {
+          todayQb.andWhere('requests.Sub_Contractor_Id = :subContractorId', { subContractorId });
+        } else if (limitToUserId) {
+          todayQb.andWhere('requests.userId = :limitToUserId', { limitToUserId });
+        }
+
+        const todayCounts = await todayQb.getRawOne();
+
+        const lastWeekQb = this.requestRepo
           .createQueryBuilder('requests')
           .select('COUNT(*)', 'totalCount')
           .addSelect(
-            "SUM(CASE WHEN requests.nightShift = '1' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.night_shift = '1' THEN 1 ELSE 0 END)",
             'nightshiftCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Draft' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Draft' THEN 1 ELSE 0 END)",
             'draftCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Hold' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Hold' THEN 1 ELSE 0 END)",
             'holdCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Pre-Approved' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Pre-Approved' THEN 1 ELSE 0 END)",
             'preApprovedCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Approved' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Approved' THEN 1 ELSE 0 END)",
             'approvedCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Rejected' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Rejected' THEN 1 ELSE 0 END)",
             'rejectedCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Opened' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Opened' THEN 1 ELSE 0 END)",
             'openedCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Cancelled' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Cancelled' THEN 1 ELSE 0 END)",
             'cancelledCount',
           )
           .addSelect(
-            "SUM(CASE WHEN requests.requestStatus = 'Closed' THEN 1 ELSE 0 END)",
+            "SUM(CASE WHEN requests.Request_status = 'Closed' THEN 1 ELSE 0 END)",
             'closedCount',
           )
           .where(
-            'requests.status = 1 AND requests.createdTime >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)',
-          )
-          .getRawOne();
+            'requests.status = 1 AND requests.Working_Date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)',
+          );
+
+        if (subContractorId) {
+          lastWeekQb.andWhere('requests.Sub_Contractor_Id = :subContractorId', { subContractorId });
+        } else if (limitToUserId) {
+          lastWeekQb.andWhere('requests.userId = :limitToUserId', { limitToUserId });
+        }
+
+        const lastWeekCounts = await lastWeekQb.getRawOne();
 
         return {
           data: {
@@ -3976,7 +4454,14 @@ export class RequestsService {
         'description_of_activity',
         subTables?.ext?.descriptionOfActivity,
       );
-      checkRequired('work_type', subTables?.ext?.workType);
+      // work_type is only required for Commissioning permit type
+      const resolvedPermitType = String(
+        dto.permit_type || (existing?.permitType) || '',
+      ).toLowerCase().trim();
+      if (resolvedPermitType === 'commissioning') {
+        checkRequired('work_type', subTables?.ext?.workType);
+      }
+
       const workTypeVal = String(
         getValue('work_type', subTables?.ext?.workType) || '',
       )
@@ -4001,12 +4486,13 @@ export class RequestsService {
       checkCheckbox('lighting_begin_work', subTables?.gen?.lightingBeginWork);
       checkCheckbox('specific_risks', subTables?.gen?.specificRisks);
       checkCheckbox('environment_ensured', subTables?.gen?.environmentEnsured);
+      // course_of_action must be validated for ALL permit types.
+      // A value of 0 (No) is a valid selection — only throw error when completely absent.
       const courseOfAction = getMultiValue(
         ['course_of_action', 'course_of_actions'],
         subTables?.gen?.courseOfActions,
       );
-      const courseOfActionNum = Number(courseOfAction);
-      if (courseOfActionNum !== 1 && courseOfActionNum !== 2) {
+      if (courseOfAction === undefined || courseOfAction === null) {
         errors.push('course_of_action must be checked');
       }
       checkRequired('other_ppe', subTables?.ppe?.otherPpe);
@@ -4368,7 +4854,7 @@ export class RequestsService {
       await this.createLogs(
         requestId,
         dto.userId ?? 0,
-        dto.Request_status ?? originalRequest.requestStatus ?? 'Pending',
+        newRequest.requestStatus ?? 'Hold',
         createdTime,
         [],
         0,
@@ -4401,8 +4887,8 @@ export class RequestsService {
 
   // --- NEW PERMIT AND LOG DATA METHODS ---
 
-  async getRequestDetailsByPermitNo(permitNo: string): Promise<any> {
-    const qb = this.requestRepo
+  private getRequestDetailsQueryBuilder() {
+    return this.requestRepo
       .createQueryBuilder('requests')
       .leftJoinAndMapOne('requests.chemical', RequestChemicalHazard, 'chemical', 'requests.id = chemical.request_id')
       .leftJoinAndMapOne('requests.confined', RequestConfined, 'confined', 'requests.id = confined.request_id')
@@ -4422,9 +4908,22 @@ export class RequestsService {
       .leftJoinAndMapOne('requests.zone', Zone, 'zone', 'requests.Zone_Id = zone.id')
       .leftJoinAndMapOne('requests.subcontractor', Subcontractor, 'subcontractor', 'requests.Sub_Contractor_Id = subcontractor.id')
       .leftJoinAndMapOne('requests.activityRelation', Activity, 'activityRelation', 'requests.Type_Of_Activity_Id = activityRelation.id')
-      .leftJoinAndMapOne('requests.user', User, 'user', 'requests.userId = user.id')
-      .where('requests.permitNo = :permitNo AND requests.status = 1', { permitNo });
+      .leftJoinAndMapOne('requests.user', User, 'user', 'requests.userId = user.id');
+  }
 
+  async getRequestDetailsByPermitNo(permitNo: string): Promise<any> {
+    const qb = this.getRequestDetailsQueryBuilder()
+      .where('requests.permitNo = :permitNo AND requests.status = 1', { permitNo });
+    return this.getRequestDetailsFromQueryBuilder(qb);
+  }
+
+  async getRequestDetailsById(id: number): Promise<any> {
+    const qb = this.getRequestDetailsQueryBuilder()
+      .where('requests.id = :id AND requests.status = 1', { id });
+    return this.getRequestDetailsFromQueryBuilder(qb);
+  }
+
+  private async getRequestDetailsFromQueryBuilder(qb: any): Promise<any> {
     const req = await qb.getOne();
     if (!req) return null;
 
@@ -4433,6 +4932,7 @@ export class RequestsService {
     const flatObj: any = {
       id: req.id,
       userId: req.userId || '',
+      created_by_user: (req as any).user?.username || '',
       Company_Name: req.companyName || '',
       PermitNo: req.permitNo || '',
       Sub_Contractor_Id: req.subContractorId || '',
@@ -4458,7 +4958,7 @@ export class RequestsService {
       Zone_Id: req.zoneId || '',
       zone_name: (req as any).zone?.zone || '',
       zone: req.zone || '',
-      Room_Nos: req.roomNos || '',
+      Room_Nos: resolvedRooms || '',
       room_names: resolvedRooms,
       Room_Type: req.roomType || '',
       Number_Of_Workers: req.numberOfWorkers || '',
@@ -4469,7 +4969,7 @@ export class RequestsService {
       status: req.status,
       createdTime: req.createdTime || '',
       Site_Id: req.siteId,
-      permit_type: req.permitType || '',
+      permit_type: req.permitType || 'Construction',
       permit_under: req.permitUnder || 'Construction',
       new_date: req.newDate || '',
       new_end_time: req.newEndTime || '',
@@ -4501,6 +5001,10 @@ export class RequestsService {
     mergeSub((req as any).ppe, this.ppeRepo);
     mergeSub((req as any).pressureTesting, this.pressureTestingRepo);
 
+    if (flatObj.course_of_actions !== undefined) {
+      flatObj.course_of_action = flatObj.course_of_actions;
+    }
+
     // Fetch Opened (check-in) log
     const checkInLog = await this.logRepo
       .createQueryBuilder('log')
@@ -4524,6 +5028,14 @@ export class RequestsService {
       flatObj.check_out_time = checkOutLog.createdTime;
       flatObj.check_out_user = (checkOutLog as any).user?.username || '';
     }
+
+    // Fetch log records for status tracking
+    flatObj.logs = await this.logRepo
+      .createQueryBuilder('log')
+      .leftJoinAndMapOne('log.user', User, 'user', 'log.userId = user.id')
+      .where('log.requestId = :requestId', { requestId: req.id })
+      .orderBy('log.id', 'ASC')
+      .getMany();
 
     // Fetch attached files & notes
     flatObj.files = await this.ramsFileRepo.find({

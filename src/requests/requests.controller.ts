@@ -12,6 +12,8 @@ import {
   HttpStatus,
   HttpCode,
   Res,
+  UseGuards,
+  Request,
 } from '@nestjs/common';
 import { FilesInterceptor, FileFieldsInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
@@ -28,6 +30,7 @@ import { generatePermitHtml } from './utils/permit-html-template';
 import { generateLogsHtml } from './utils/logs-html-template';
 import { buildPermitPdf, buildLogsPdf } from './utils/pdf-generator';
 import { PlanSearchDto } from './dtos/planssearch.dto';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
 // Ensure directory exists
 const uploadDir = './uploads/requests';
@@ -102,6 +105,10 @@ export class RequestsController {
       [
         { name: 'rams_file', maxCount: 10 },
         { name: 'rams_file[]', maxCount: 10 },
+        { name: 'images', maxCount: 10 },
+        { name: 'images[]', maxCount: 10 },
+        { name: 'fire_image', maxCount: 10 },
+        { name: 'fire_image[]', maxCount: 10 },
       ],
       requestMulterOptions,
     ),
@@ -109,14 +116,28 @@ export class RequestsController {
   async update(
     @Param('id') id: string,
     @Body() updateDto: UpdateRequestDto,
-    @UploadedFiles() files?: { rams_file?: any[]; 'rams_file[]'?: any[] },
+    @UploadedFiles()
+    files?: {
+      rams_file?: any[];
+      'rams_file[]'?: any[];
+      images?: any[];
+      'images[]'?: any[];
+      fire_image?: any[];
+      'fire_image[]'?: any[];
+    },
   ) {
     try {
       const ramsFiles = [
         ...(files?.rams_file || []),
         ...(files?.['rams_file[]'] || []),
       ];
-      const result = await this.requestsService.update(Number(id), updateDto, ramsFiles);
+      const imageFiles = [
+        ...(files?.images || []),
+        ...(files?.['images[]'] || []),
+        ...(files?.fire_image || []),
+        ...(files?.['fire_image[]'] || []),
+      ];
+      const result = await this.requestsService.update(Number(id), updateDto, ramsFiles, imageFiles);
       return result;
     } catch (error) {
       return {
@@ -128,10 +149,11 @@ export class RequestsController {
 
   // 3. Search Requests
   @Post('search')
+  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
-  async search(@Body() searchDto: SearchRequestDto) {
+  async search(@Body() searchDto: SearchRequestDto, @Request() req: any) {
     try {
-      const results = await this.requestsService.search(searchDto);
+      const results = await this.requestsService.search(searchDto, req.user?.userId);
       return results;
     } catch (error) {
       return {
@@ -223,7 +245,8 @@ export class RequestsController {
       if (!fs.existsSync(absolutePath)) {
         return res.status(HttpStatus.NOT_FOUND).send('File not found on disk');
       }
-      res.sendFile(absolutePath);
+      const filename = file.ramsFile.split('/').pop() || 'Attachment';
+      res.download(absolutePath, filename);
     } catch (error) {
       res.status(HttpStatus.INTERNAL_SERVER_ERROR).send(error.message);
     }
@@ -298,9 +321,10 @@ export class RequestsController {
 
   // 15. Fetch requests counts (readCounts.php)
   @Get('counts')
-  async readCounts() {
+  @UseGuards(JwtAuthGuard)
+  async readCounts(@Request() req: any) {
     try {
-      return await this.requestsService.readCounts();
+      return await this.requestsService.readCounts(req.user?.userId);
     } catch (error) {
       return { message: error.message };
     }
@@ -308,9 +332,10 @@ export class RequestsController {
 
   // 16. Fetch request status count (readRequestCount.php)
   @Post('counts/status')
-  async readRequestCount(@Body('Request_status') status: string) {
+  @UseGuards(JwtAuthGuard)
+  async readRequestCount(@Body('Request_status') status: string, @Request() req: any) {
     try {
-      return await this.requestsService.readRequestCount(status);
+      return await this.requestsService.readRequestCount(status, req.user?.userId);
     } catch (error) {
       return { message: error.message };
     }
@@ -318,9 +343,10 @@ export class RequestsController {
 
   // 17. Fetch plans list with nested notes (planslist.php)
   @Post('plans')
-  async plansList(@Body() searchDto: PlanSearchDto) {
+  // @UseGuards(JwtAuthGuard)
+  async plansList(@Body() searchDto: PlanSearchDto, @Request() req: any) {
     try {
-      const result = await this.requestsService.plansList(searchDto);
+      const result = await this.requestsService.plansList(searchDto, req.user?.userId);
       return [result[0], result[1]];
     } catch (error) {
       return { message: error.message };
@@ -329,9 +355,10 @@ export class RequestsController {
 
   // 18. Fetch Graph counts per day (readGraph.php)
   @Post('analytics/graph')
-  async readGraph(@Body() body: { WeekFirstday: string; WeekLastday: string }) {
+  @UseGuards(JwtAuthGuard)
+  async readGraph(@Body() body: { WeekFirstday: string; WeekLastday: string }, @Request() req: any) {
     try {
-      return await this.requestsService.readGraph(body.WeekFirstday, body.WeekLastday);
+      return await this.requestsService.readGraph(body.WeekFirstday, body.WeekLastday, req.user?.userId);
     } catch (error) {
       return { message: error.message };
     }
@@ -339,9 +366,10 @@ export class RequestsController {
 
   // 19. Fetch Graph summary (readGraphCounts.php)
   @Get('analytics/graph/counts')
-  async readGraphCounts() {
+  @UseGuards(JwtAuthGuard)
+  async readGraphCounts(@Request() req: any) {
     try {
-      return await this.requestsService.readGraphCounts();
+      return await this.requestsService.readGraphCounts(req.user?.userId);
     } catch (error) {
       return { message: error.message };
     }
@@ -412,6 +440,26 @@ export class RequestsController {
       res.end(pdfBuffer);
     } catch (error) {
       res.status(HttpStatus.INTERNAL_SERVER_ERROR).send(error.message);
+    }
+  }
+
+  // 20. Fetch Request details by ID
+  @Get(':id')
+  async getRequestDetailsById(@Param('id') id: string) {
+    try {
+      const data = await this.requestsService.getRequestDetailsById(Number(id));
+      if (!data) {
+        return {
+          status: HttpStatus.NOT_FOUND,
+          message: `Request with ID ${id} not found`,
+        };
+      }
+      return data;
+    } catch (error) {
+      return {
+        status: HttpStatus.INTERNAL_SERVER_ERROR,
+        message: error.message || 'Failed to retrieve request details',
+      };
     }
   }
 }
