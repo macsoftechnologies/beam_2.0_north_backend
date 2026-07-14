@@ -190,6 +190,7 @@ export class EmployeesController {
   }
 
   @Post('search')
+  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Paginated employee search' })
   @ApiBody({ type: SearchEmployeeDto })
@@ -203,9 +204,6 @@ export class EmployeesController {
       ],
     },
   })
-  @Post('search')
-  @UseGuards(JwtAuthGuard)
-  @HttpCode(HttpStatus.OK)
   search(@Body() dto: SearchEmployeeDto, @Request() req: any) {
     return this.employeeService.search(dto, req.user?.userId);
   }
