@@ -17,6 +17,8 @@ export function generatePermitHtml(data: any): string {
   const imgCranesLifting = getBase64Image(join(process.cwd(), 'src/images/logos/Craneslifting.png'));
   const imgElectricalWorks = getBase64Image(join(process.cwd(), 'src/images/logos/electrical_works.png'));
   const imgMechanicalWorks = getBase64Image(join(process.cwd(), 'src/images/logos/mechanical1.png'));
+  const imgCompanyLogo = getBase64Image(join(process.cwd(), 'src/images/logos/Logo.jpeg')) || getBase64Image(join(process.cwd(), '../frontend/Beam2.o_Infrastructure/src/assets/images/Logo.jpeg'));
+  const imgNneLogo = getBase64Image(join(process.cwd(), 'src/images/logos/nne_logo.png')) || getBase64Image(join(process.cwd(), '../frontend/Beam2.o_Infrastructure/src/assets/images/nne_logo.png'));
 
   // Format Helper for Date
   const formatDateOnly = (dateStr: any) => {
@@ -119,6 +121,19 @@ export function generatePermitHtml(data: any): string {
       return imageVal;
     }
     const filename = imageVal.split('/').pop() || imageVal;
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const localPath = path.join(process.cwd(), './uploads/requests', filename);
+      if (fs.existsSync(localPath)) {
+        const ext = path.extname(filename).toLowerCase().replace('.', '');
+        const mime = ext === 'png' ? 'image/png' : 'image/jpeg';
+        const base64Data = fs.readFileSync(localPath, { encoding: 'base64' });
+        return `data:${mime};base64,${base64Data}`;
+      }
+    } catch (e) {
+      // ignore and fallback
+    }
     return `/requests/${filename}`;
   };
 
@@ -343,14 +358,32 @@ export function generatePermitHtml(data: any): string {
     iconType: string;
   }[] = [];
 
-  // Step 1: Draft or Hold
-  const firstStepLabel = logDraft ? 'Draft' : 'Hold';
-  const firstStepLog = logDraft || logHold;
-  trackingSteps.push({
-    label: firstStepLabel,
-    log: firstStepLog,
-    iconType: firstStepLabel.toLowerCase(),
-  });
+  // Determine if the tracking starts from Hold (no Draft log, or first log is Hold)
+  const startsWithHold = logsList.length > 0 &&
+    logsList[0].requestType &&
+    logsList[0].requestType.toLowerCase().trim() === 'hold';
+
+  if (startsWithHold) {
+    // Starts with Hold: Hide Draft, show Hold as the first step
+    trackingSteps.push({
+      label: 'Hold',
+      log: logHold || (requestStatus.toLowerCase() === 'hold' ? { createdTime: data.createdTime || new Date(), user: { username: 'System' } } : undefined),
+      iconType: 'hold',
+    });
+  } else {
+    // Starts with Draft (compulsory first step)
+    trackingSteps.push({
+      label: 'Draft',
+      log: logDraft || (requestStatus.toLowerCase() === 'draft' || logsList.length === 0 ? { createdTime: data.createdTime || new Date(), user: { username: 'System' } } : undefined),
+      iconType: 'draft',
+    });
+    // Add Hold status after Draft
+    trackingSteps.push({
+      label: 'Hold',
+      log: logHold || (requestStatus.toLowerCase() === 'hold' ? { createdTime: new Date(), user: { username: 'System' } } : undefined),
+      iconType: 'hold',
+    });
+  }
 
   // Check Pre-Approved
   if (logPreApproved || requestStatus.toLowerCase() === 'pre-approved') {
@@ -377,9 +410,16 @@ export function generatePermitHtml(data: any): string {
     });
 
     // Check if Cancelled after approved
-    if (logCancelled || requestStatus.toLowerCase() === 'cancelled') {
+    if (
+      logCancelled ||
+      requestStatus.toLowerCase() === 'cancelled' ||
+      requestStatus.toLowerCase() === 'auto-cancelled'
+    ) {
+      const isAutoCancelled =
+        requestStatus.toLowerCase() === 'auto-cancelled' ||
+        (logCancelled && Number(logCancelled.system) === 1);
       trackingSteps.push({
-        label: 'Cancelled',
+        label: isAutoCancelled ? 'Auto-Cancelled' : 'Cancelled',
         log: logCancelled,
         iconType: 'cancelled',
       });
@@ -424,7 +464,7 @@ export function generatePermitHtml(data: any): string {
     if (step.label === 'Rejected') {
       return `${baseClass} step-rejected`;
     }
-    if (step.label === 'Cancelled') {
+    if (step.label === 'Cancelled' || step.label === 'Auto-Cancelled') {
       return `${baseClass} step-cancelled`;
     }
     return baseClass;
@@ -520,7 +560,8 @@ export function generatePermitHtml(data: any): string {
       case 'approved':
         return `
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="${color}" stroke-width="2" width="20" height="20">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-16 0 9 9 0 0116 0z" />
+            <circle cx="12" cy="12" r="9" />
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.5l2 2 4-4" />
           </svg>
         `;
       case 'opened':
@@ -563,7 +604,7 @@ export function generatePermitHtml(data: any): string {
       ? `
         <div class="step-meta" style="font-size: 10px; color: #64748b; margin-top: 6px; line-height: 1.3; font-weight: 500; word-break: break-all; max-width: 100px;">
           <div>${formatDateTime(step.log.createdTime)}</div>
-          <div style="font-weight: 600; color: #475569; margin-top: 1px;">By: ${step.log.user?.username || `User #${step.log.userId}` || ''}</div>
+          <div style="font-weight: 600; color: #475569; margin-top: 1px;">By: ${Number(step.log.system) === 1 ? 'System' : (step.log.user?.username || `User #${step.log.userId}` || '')}</div>
         </div>
       `
       : '';
@@ -763,6 +804,131 @@ export function generatePermitHtml(data: any): string {
       `;
     }
 
+    if (Number(data.pressure_testing_of_equipment) === 1) {
+      html += `
+        <div class="active-hazard-card mb-3">
+          <div class="active-hazard-header">
+            <div class="active-hazard-title-wrap">
+              <span class="hazard-warning-icon">
+                <img src="${imgTestingEquipment}" style="width: 24px; height: 24px; object-fit: contain; vertical-align: middle;">
+              </span>
+              <div>
+                <div class="hazard-title">Pressure Testing of Equipment</div>
+                <div class="hazard-risk text-warning">Pressure Risk</div>
+              </div>
+            </div>
+            <div class="hazard-check-status">
+              <span class="hazard-check-circle bg-green-light color-green">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" style="width: 16px; height: 16px; display: inline-block;">
+                  <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
+                </svg>
+              </span>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    if (Number(data.excavation_works) === 1) {
+      html += `
+        <div class="active-hazard-card mb-3">
+          <div class="active-hazard-header">
+            <div class="active-hazard-title-wrap">
+              <span class="hazard-warning-icon">
+                <img src="${imgExcavationWorks}" style="width: 24px; height: 24px; object-fit: contain; vertical-align: middle;">
+              </span>
+              <div>
+                <div class="hazard-title">Excavation Works</div>
+                <div class="hazard-risk text-danger">Ground Risk</div>
+              </div>
+            </div>
+            <div class="hazard-check-status">
+              <span class="hazard-check-circle bg-green-light color-green">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" style="width: 16px; height: 16px; display: inline-block;">
+                  <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
+                </svg>
+              </span>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    if (Number(data.using_cranes_or_lifting) === 1) {
+      html += `
+        <div class="active-hazard-card mb-3">
+          <div class="active-hazard-header">
+            <div class="active-hazard-title-wrap">
+              <span class="hazard-warning-icon">
+                <img src="${imgCranesLifting}" style="width: 24px; height: 24px; object-fit: contain; vertical-align: middle;">
+              </span>
+              <div>
+                <div class="hazard-title">Cranes &amp; Lifting</div>
+                <div class="hazard-risk text-danger">Lifting Risk</div>
+              </div>
+            </div>
+            <div class="hazard-check-status">
+              <span class="hazard-check-circle bg-green-light color-green">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" style="width: 16px; height: 16px; display: inline-block;">
+                  <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
+                </svg>
+              </span>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    if (Number(data.power_on) === 1) {
+      html += `
+        <div class="active-hazard-card mb-3">
+          <div class="active-hazard-header">
+            <div class="active-hazard-title-wrap">
+              <span class="hazard-warning-icon">
+                <img src="${imgElectricalWorks}" style="width: 24px; height: 24px; object-fit: contain; vertical-align: middle;">
+              </span>
+              <div>
+                <div class="hazard-title">Electrical Works</div>
+                <div class="hazard-risk text-warning">Electrical Risk</div>
+              </div>
+            </div>
+            <div class="hazard-check-status">
+              <span class="hazard-check-circle bg-green-light color-green">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" style="width: 16px; height: 16px; display: inline-block;">
+                  <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
+                </svg>
+              </span>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    if (Number(data.pressurization) === 1) {
+      html += `
+        <div class="active-hazard-card mb-3">
+          <div class="active-hazard-header">
+            <div class="active-hazard-title-wrap">
+              <span class="hazard-warning-icon">
+                <img src="${imgMechanicalWorks}" style="width: 24px; height: 24px; object-fit: contain; vertical-align: middle;">
+              </span>
+              <div>
+                <div class="hazard-title">Mechanical Works</div>
+                <div class="hazard-risk text-primary">Mechanical Risk</div>
+              </div>
+            </div>
+            <div class="hazard-check-status">
+              <span class="hazard-check-circle bg-green-light color-green">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" style="width: 16px; height: 16px; display: inline-block;">
+                  <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
+                </svg>
+              </span>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
     if (html === '') {
       html = '<p class="text-muted">No active hazard checklists.</p>';
     }
@@ -771,28 +937,32 @@ export function generatePermitHtml(data: any): string {
 
   // Compile complex map loops to safe HTML variables BEFORE starting the return string literal
   const attachmentsHtml = data.files && data.files.length > 0
-    ? data.files.map((file: any) => {
-      const filename = file.ramsFile ? file.ramsFile.split('/').pop() : 'Attachment';
-      return `
-          <a href="/requests/files/${file.ramsFileId}" download class="attachment-box">
-            <div class="attachment-icon-wrap">
-              <svg class="attachment-file-icon text-danger" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
-              </svg>
-            </div>
-            <div class="attachment-details">
-              <span class="attachment-name">${filename}</span>
-              <span class="attachment-size">Click to download</span>
-            </div>
-            <div class="attachment-download-icon">
-              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" style="width: 18px; height: 18px; color: #64748b;">
-                <path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clip-rule="evenodd" />
-              </svg>
-            </div>
-          </a>
-        `;
-    }).join('')
-    : '<p class="text-muted">No attachments.</p>';
+    ? `<div class="attachments-grid" style="margin-top: 6px;">
+        ${data.files.map((file: any) => {
+          const rawPath = file.ramsFile || file.rams_file || file.file || '';
+          const filename = rawPath ? rawPath.split('/').pop().split('\\').pop() : 'Attachment';
+          const fileId = file.ramsFileId !== undefined ? file.ramsFileId : (file.rams_file_id !== undefined ? file.rams_file_id : file.id);
+          return `
+            <a href="/requests/files/${fileId}" target="_blank" download class="attachment-box">
+              <div class="attachment-icon-wrap">
+                <svg class="attachment-file-icon text-danger" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                </svg>
+              </div>
+              <div class="attachment-details">
+                <span class="attachment-name">${filename}</span>
+                <span class="attachment-size">Click to download</span>
+              </div>
+              <div class="attachment-download-icon">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" style="width: 18px; height: 18px; color: #64748b;">
+                  <path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clip-rule="evenodd" />
+                </svg>
+              </div>
+            </a>
+          `;
+        }).join('')}
+      </div>`
+    : '<div class="info-value" style="color: #94a3b8; font-style: italic; margin-top: 4px;">No RAMS files uploaded</div>';
 
   const imagesHtml = data.images && data.images.length > 0
     ? data.images.map((img: any, index: number) => `
@@ -858,6 +1028,18 @@ export function generatePermitHtml(data: any): string {
   } else {
     approvalsHtml = `<div class="info-label">ConM initials</div><div class="info-value mb-2">${conm}</div>`;
   }
+
+  const mechanicalWorksText = (data.resolvedMechanicalWorks && Array.isArray(data.resolvedMechanicalWorks) && data.resolvedMechanicalWorks.length > 0)
+    ? data.resolvedMechanicalWorks.join(', ')
+    : (data.mechanical_works || '');
+
+  const panelNumbersText = (data.resolvedPanelNumbers && Array.isArray(data.resolvedPanelNumbers) && data.resolvedPanelNumbers.length > 0)
+    ? data.resolvedPanelNumbers.join(', ')
+    : '';
+
+  const systemNumbersText = (data.resolvedSystemNumbers && Array.isArray(data.resolvedSystemNumbers) && data.resolvedSystemNumbers.length > 0)
+    ? data.resolvedSystemNumbers.join(', ')
+    : '';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1142,12 +1324,37 @@ export function generatePermitHtml(data: any): string {
       color: #f97316 !important;
     }
 
+    /* Stats outer wrapper: check-in/out group on left, stats row on right */
+    .stats-outer-wrap {
+      display: flex;
+      align-items: stretch;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .stats-checkinout-group {
+      display: flex;
+      flex-direction: row;
+      gap: 16px;
+      flex-shrink: 0;
+    }
+    .stats-checkinout-group .stats-card {
+      min-width: 180px;
+    }
+    @media (max-width: 768px) {
+      .stats-outer-wrap {
+        flex-direction: column;
+      }
+      .stats-checkinout-group {
+        flex-wrap: wrap;
+      }
+    }
+
     /* Stats Grid */
     .stats-row {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
       gap: 16px;
-      margin-bottom: 24px;
+      flex: 1;
     }
     .stats-card {
       background: #ffffff;
@@ -1207,14 +1414,14 @@ export function generatePermitHtml(data: any): string {
     .color-purple { color: #a855f7; fill: #a855f7; }
     .text-purple { color: #7c3aed; }
 
-    /* Columns Layout */
-    .dashboard-grid {
+    /* 2-Column Side-by-Side Grid */
+    .two-col-grid {
       display: grid;
-      grid-template-columns: 4fr 5fr;
+      grid-template-columns: 1fr 1fr;
       gap: 24px;
     }
     @media (max-width: 992px) {
-      .dashboard-grid {
+      .two-col-grid {
         grid-template-columns: 1fr;
       }
     }
@@ -1287,18 +1494,40 @@ export function generatePermitHtml(data: any): string {
       border-bottom: none;
     }
 
-    /* Active Hazard card */
+    /* Active Hazard card (Uniform 5-column grid layout) */
+    .active-hazards-list {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+    }
     .active-hazard-card {
       background-color: #fef2f2;
       border: 1px solid #fee2e2;
-      border-radius: 12px;
-      padding: 16px;
+      border-radius: 10px;
+      padding: 10px 12px;
+      box-sizing: border-box;
+      width: 100%;
+    }
+    @media (max-width: 1200px) {
+      .active-hazards-list {
+        grid-template-columns: repeat(3, 1fr);
+      }
+    }
+    @media (max-width: 768px) {
+      .active-hazards-list {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+    @media (max-width: 480px) {
+      .active-hazards-list {
+        grid-template-columns: 1fr;
+      }
     }
     .active-hazard-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 12px;
+      margin-bottom: 0;
     }
     .active-hazard-title-wrap {
       display: flex;
@@ -1482,8 +1711,8 @@ export function generatePermitHtml(data: any): string {
 
     /* Attachments download row */
     .attachments-grid {
-      display: flex;
-      flex-direction: column;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
       gap: 10px;
     }
     .attachment-box {
@@ -1641,18 +1870,20 @@ export function generatePermitHtml(data: any): string {
       .permit-container {
         margin: 0;
         padding: 0;
-        max-width: 100%;
+        max-width: 100% !important;
+        width: 100% !important;
       }
       .dashboard-card {
-        box-shadow: none;
-        border: 1px solid #cbd5e1;
-        page-break-inside: avoid;
+        box-shadow: none !important;
+        border: 1px solid #cbd5e1 !important;
+        page-break-inside: avoid !important;
+        margin-bottom: 16px !important;
       }
       .confirm-pg-download-container {
-        display: none;
+        display: none !important;
       }
       .back-btn {
-        display: none;
+        display: none !important;
       }
     }
   </style>
@@ -1663,34 +1894,24 @@ export function generatePermitHtml(data: any): string {
     
     <!-- Top Dashboard Card (Header, Actions, Stepper) -->
     <div class="dashboard-card">
-      <div class="header-layout" style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: nowrap; gap: 16px; width: 100%;">
-        <div class="header-title-section" style="display: flex; align-items: center; gap: 16px; min-width: 0; flex-grow: 1;">
-          <div class="back-btn" onclick="window.history.back()" style="flex-shrink: 0;">
-            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" style="width: 20px; height: 20px;">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-            </svg>
+      <!-- Header Section: Row 1 (Logos & PDF), Row 2 (Permit #, Badges & Location) -->
+      <div class="header-section-wrap" style="width: 100%; margin-bottom: 20px;">
+        <!-- Row 1: Logos (Optically balanced) -->
+        <div class="header-logos-row" style="display: flex; justify-content: space-between; align-items: center; width: 100%; border-bottom: 1px solid #f1f5f9; padding: 0 40px 14px 40px; margin-bottom: 16px; box-sizing: border-box;">
+          <!-- Left: Novo Nordisk Logo -->
+          <div style="display: flex; align-items: center;">
+            ${imgCompanyLogo ? `<img src="${imgCompanyLogo}" alt="Novo Nordisk Logo" style="height: 110px; width: auto; object-fit: contain; display: block;" />` : ''}
           </div>
-          <div class="header-details-wrap" style="min-width: 0; flex-grow: 1;">
-            <h1 class="permit-title" style="margin: 0;">Permit #${data.PermitNo || '-'}</h1>
-            <div class="badge-row" style="margin-top: 4px;">
-              <span class="header-badge">${data.activityName || data.Activity || 'Activity'}</span>
-              <span class="header-badge badge-risk">${getRiskLevel()} Risk</span>
-              <span class="header-badge badge-status">${getStatusText()}</span>
-              <span class="location-pin-text" style="display: inline-block; vertical-align: middle;">
-                <img src="${locationPinDataUrl}" style="width: 14px; height: 14px; display: inline-block; vertical-align: middle; margin-right: 4px;" />
-                <span style="vertical-align: middle;">${formatRooms(data.room_names || data.Room_Nos || data.zone_name)}</span>
-              </span>
-            </div>
+
+          <!-- Right: NNE Logo -->
+          <div style="display: flex; align-items: center;">
+            ${imgNneLogo ? `<img src="${imgNneLogo}" alt="NNE Logo" style="height: 56px; width: auto; object-fit: contain; display: block;" />` : ''}
           </div>
         </div>
-        <div class="header-actions" style="flex-shrink: 0; display: flex; align-items: center; gap: 10px;">
-          <button class="btn-action" onclick="test()">
-            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" style="width: 16px; height: 16px;">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-            </svg>
-            PDF
-          </button>
-          <div class="triple-dots" style="padding: 8px;">&#8942;</div>
+
+        <!-- Row 2: Permit # Title below logos (Center Aligned) -->
+        <div class="header-details-row" style="width: 100%; text-align: center;">
+          <h1 class="permit-title" style="margin: 0 auto; font-size: 25px; font-weight: 800; color: #1e293b; letter-spacing: -0.2px; text-align: center;">Permit <span style="color: #ea580c; font-weight: 800;">#${data.PermitNo || '-'}</span></h1>
         </div>
       </div>
       
@@ -1706,306 +1927,308 @@ export function generatePermitHtml(data: any): string {
     </div>
 
     <!-- Statistics Row Widget -->
-    <div class="stats-row">
-      <div class="stats-card">
-        <div class="stats-icon-wrap bg-blue-light">
-          <img src="${statusIconDataUrl}" style="width: 20px; height: 20px; display: block;" />
-        </div>
-        <div class="stats-info">
-          <div class="stats-label">Status</div>
-          <div class="stats-value text-blue">${getStatusText()}</div>
-        </div>
+    <div class="stats-outer-wrap">
+      ${(data.check_in_time || (data.Request_status === 'Closed' && data.check_out_time)) ? `
+      <div class="stats-checkinout-group">
+        ${data.check_in_time ? `
+          <div class="stats-card" style="background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%); border: 1px solid #86efac; border-left: 4px solid #22c55e;">
+            <div class="stats-icon-wrap" style="background-color: #ffffff;">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="#22c55e" style="width: 20px; height: 20px; display: block;">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            </div>
+            <div class="stats-info">
+              <div class="stats-label" style="color: #15803d; font-weight: 800;">Checked In</div>
+              <div class="stats-value" style="color: #14532d; font-size: 13px; font-weight: 800;">${formatDateTime(data.check_in_time)}</div>
+              <div style="font-size: 11px; color: #15803d; font-weight: 700; margin-top: 1px;">${data.check_in_user || '-'}</div>
+            </div>
+          </div>
+        ` : ''}
+        ${(data.Request_status === 'Closed' && data.check_out_time) ? `
+          <div class="stats-card" style="background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%); border: 1px solid #fca5a5; border-left: 4px solid #ef4444;">
+            <div class="stats-icon-wrap" style="background-color: #ffffff;">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.5" stroke="#ef4444" style="width: 20px; height: 20px; display: block;">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75" />
+              </svg>
+            </div>
+            <div class="stats-info">
+              <div class="stats-label" style="color: #b91c1c; font-weight: 800;">Checked Out</div>
+              <div class="stats-value" style="color: #7f1d1d; font-size: 13px; font-weight: 800;">${formatDateTime(data.check_out_time)}</div>
+              <div style="font-size: 11px; color: #b91c1c; font-weight: 700; margin-top: 1px;">${data.check_out_user || '-'}</div>
+            </div>
+          </div>
+        ` : ''}
       </div>
-      <div class="stats-card">
-        <div class="stats-icon-wrap bg-red-light">
-          <img src="${companyIconDataUrl}" style="width: 20px; height: 20px; display: block;" />
-        </div>
-        <div class="stats-info">
-          <div class="stats-label">Contractor</div>
-          <div class="stats-value text-red" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px;">
-            ${data.subContractorName || data.Company_Name || '-'}
+      ` : ''}
+      <div class="stats-row">
+        <div class="stats-card">
+          <div class="stats-icon-wrap bg-red-light">
+            <img src="${companyIconDataUrl}" style="width: 20px; height: 20px; display: block;" />
+          </div>
+          <div class="stats-info">
+            <div class="stats-label">Contractor</div>
+            <div class="stats-value text-red" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px;">
+              ${data.subContractorName || data.Company_Name || '-'}
+            </div>
           </div>
         </div>
-      </div>
-      <div class="stats-card">
-        <div class="stats-icon-wrap bg-orange-light">
-          <img src="${calendarIconDataUrl}" style="width: 20px; height: 20px; display: block;" />
+        <div class="stats-card">
+          <div class="stats-icon-wrap bg-orange-light">
+            <img src="${calendarIconDataUrl}" style="width: 20px; height: 20px; display: block;" />
+          </div>
+          <div class="stats-info">
+            <div class="stats-label">Date</div>
+            <div class="stats-value text-orange">${formatDateOnly(data.Working_Date)}</div>
+          </div>
         </div>
-        <div class="stats-info">
-          <div class="stats-label">Date</div>
-          <div class="stats-value text-orange">${formatDateOnly(data.Working_Date)}</div>
+        <div class="stats-card">
+          <div class="stats-icon-wrap bg-green-light">
+            <img src="${workersIconDataUrl}" style="width: 20px; height: 20px; display: block;" />
+          </div>
+          <div class="stats-info">
+            <div class="stats-label">Workers</div>
+            <div class="stats-value text-green">${data.Number_Of_Workers || '0'}</div>
+          </div>
         </div>
-      </div>
-      <div class="stats-card">
-        <div class="stats-icon-wrap bg-green-light">
-          <img src="${workersIconDataUrl}" style="width: 20px; height: 20px; display: block;" />
-        </div>
-        <div class="stats-info">
-          <div class="stats-label">Workers</div>
-          <div class="stats-value text-green">${data.Number_Of_Workers || '0'}</div>
-        </div>
-      </div>
-      <div class="stats-card">
-        <div class="stats-icon-wrap bg-grey-light">
-          <img src="${durationIconDataUrl}" style="width: 20px; height: 20px; display: block;" />
-        </div>
-        <div class="stats-info">
-          <div class="stats-label">Duration</div>
-          <div class="stats-value text-grey">${getDuration()}</div>
+        <div class="stats-card">
+          <div class="stats-icon-wrap bg-grey-light">
+            <img src="${durationIconDataUrl}" style="width: 20px; height: 20px; display: block;" />
+          </div>
+          <div class="stats-info">
+            <div class="stats-label">Duration</div>
+            <div class="stats-value text-grey">${getDuration()}</div>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- Two Column Dashboard Grid -->
-    <div class="dashboard-grid">
-      
-      <!-- Left Column -->
-      <div>
+    <!-- Active Hazards (Top Section) -->
+    <div class="dashboard-card" style="margin-bottom: 20px;">
+      <div class="card-section-header">
+        <div class="card-section-title-wrap">
+          <span class="card-section-icon">
+            ${getCardHeaderIcon('hazards')}
+          </span>
+          <div>
+            <h2 class="card-section-title">Active Hazards</h2>
+            <p class="card-section-subtitle">Identified risks for this permit</p>
+          </div>
+        </div>
+      </div>
+      <div class="active-hazards-list">
+        ${renderActiveHazardCards()}
+      </div>
+    </div>
 
-        <!-- Check-in & Check-out Status (Moved here, above Location & Schedule) -->
-        ${(data.check_in_time || (data.Request_status === 'Closed' && data.check_out_time)) ? `
-          <div class="row mb-1">
-            ${data.check_in_time ? `
-              <div class="col-md-6 mb-3">
-                <div class="dashboard-card mb-0" style="background-color: #f0fdf4; border: 1px solid #bbf7d0; padding: 16px;">
-                  <div class="info-label" style="color: #15803d; font-size: 11px;">Checked In</div>
-                  <div class="info-value mb-2" style="color: #166534; font-size: 14px;">${formatDateTime(data.check_in_time)}</div>
-                  <div class="info-label" style="color: #15803d; font-size: 10px;">User</div>
-                  <div class="info-value" style="color: #166534; font-size: 13px;">${data.check_in_user || '-'}</div>
-                </div>
+    <!-- Location & Schedule Section -->
+    <div class="dashboard-card" style="margin-bottom: 20px;">
+      <div class="card-section-header">
+        <div class="card-section-title-wrap">
+          <span class="card-section-icon">
+            ${getCardHeaderIcon('location')}
+          </span>
+          <div>
+            <h2 class="card-section-title">Location & Schedule</h2>
+            <p class="card-section-subtitle">Where and when the work occurs</p>
+          </div>
+        </div>
+      </div>
+      <div class="info-grid">
+        <div>
+          <div class="info-label">Building</div>
+          <div class="info-value">${data.building_name || '-'}</div>
+        </div>
+        <div>
+          <div class="info-label">Level</div>
+          <div class="info-value">${data.Room_Type || '-'}</div>
+        </div>
+        <div>
+          <div class="info-label">Zone</div>
+          <div class="info-value">${data.zone_name || '-'}</div>
+        </div>
+        <div>
+          <!-- Empty spacer to align the grid -->
+        </div>
+        <div class="info-fullwidth">
+          <div class="info-label">Specific Rooms</div>
+          <div class="info-value">${formatRooms(data.room_names || data.Room_Nos)}</div>
+        </div>
+        <div>
+          <div class="info-label">Permit Type</div>
+          <div class="info-value">${data.permit_type || '-'}</div>
+        </div>
+        <div>
+          <div class="info-label">Permit Under</div>
+          <div class="info-value">${data.permit_under || 'Construction'}</div>
+        </div>
+        <div>
+          <div class="info-label">Date</div>
+          <div class="info-value">${formatDateOnly(data.Working_Date)}</div>
+        </div>
+        <div>
+          <div class="info-label">Time</div>
+          <div class="info-value">${formatTimeOnly(data.Start_Time)} - ${formatTimeOnly(data.End_Time)}</div>
+        </div>
+        
+        ${Number(data.night_shift) === 1 ? `
+        <div class="info-fullwidth" style="margin-top: 4px;">
+          <div style="background: linear-gradient(135deg, #1e1b4b 0%, #312e81 100%); border: 1px solid #4338ca; border-left: 5px solid #818cf8; border-radius: 8px; padding: 14px 16px; box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2); display: flex; gap: 32px; align-items: flex-start;">
+            <div style="display: flex; align-items: center; gap: 10px; flex: 1;">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#818cf8" style="width: 22px; height: 22px; flex-shrink: 0;">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M21.752 15.002A9.72 9.72 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 009.002-5.998z" />
+              </svg>
+              <div>
+                <div style="font-size: 10px; font-weight: 800; color: #a5b4fc; letter-spacing: 0.5px; margin-bottom: 3px;">NEW DATE (Working After Midnight)</div>
+                <div style="font-size: 14px; font-weight: 800; color: #e0e7ff;">${formatDateOnly(data.new_date)}</div>
               </div>
-            ` : ''}
-            ${(data.Request_status === 'Closed' && data.check_out_time) ? `
-              <div class="col-md-6 mb-3">
-                <div class="dashboard-card mb-0" style="background-color: #fef2f2; border: 1px solid #fecaca; padding: 16px;">
-                  <div class="info-label" style="color: #b91c1c; font-size: 11px;">Checked Out</div>
-                  <div class="info-value mb-2" style="color: #991b1b; font-size: 14px;">${formatDateTime(data.check_out_time)}</div>
-                  <div class="info-label" style="color: #b91c1c; font-size: 10px;">User</div>
-                  <div class="info-value" style="color: #991b1b; font-size: 13px;">${data.check_out_user || '-'}</div>
-                </div>
-              </div>
-            ` : ''}
+            </div>
+            <div style="flex: 1; border-left: 1px solid #4338ca; padding-left: 24px;">
+              <div style="font-size: 10px; font-weight: 800; color: #a5b4fc; letter-spacing: 0.5px; margin-bottom: 3px;">NEW END TIME</div>
+              <div style="font-size: 14px; font-weight: 800; color: #e0e7ff;">${formatTimeOnly(data.new_end_time)}</div>
+            </div>
+          </div>
+        </div>
+        ` : ''}
+      </div>
+    </div>
+
+    <!-- Work Details & Resources Section -->
+    <div class="dashboard-card" style="margin-bottom: 20px;">
+      <div class="card-section-header">
+        <div class="card-section-title-wrap">
+          <span class="card-section-icon">
+            ${getCardHeaderIcon('tools')}
+          </span>
+          <div>
+            <h2 class="card-section-title">Work Details & Resources</h2>
+            <p class="card-section-subtitle">Contractors, tools, and machinery</p>
+          </div>
+        </div>
+      </div>
+      <div class="info-grid">
+        <div>
+          <div class="info-label">Project Name</div>
+          <div class="info-value">${data.Company_Name || '-'}</div>
+        </div>
+        <div>
+          <div class="info-label">Sub-Contractor</div>
+          <div class="info-value">${data.new_sub_contractor || data.subContractorName || data.Company_Name || '-'}</div>
+        </div>
+        <div>
+          <div class="info-label">Activity</div>
+          <div class="info-value">${data.Activity || data.activityName || '-'}</div>
+        </div>
+        <div>
+          <div class="info-label">Type of Activity</div>
+          <div class="info-value">${data.activityName || data.Activity || '-'}</div>
+        </div>
+        <div>
+          <div class="info-label">RAMS Number</div>
+          <div class="info-value">${data.rams_number || '-'}</div>
+        </div>
+        ${String(data.permit_type || '').toLowerCase().trim() === 'commissioning' ? `
+        <div>
+          <div class="info-label">Type of Work</div>
+          <div class="info-value">${data.work_type || '-'}</div>
+        </div>
+        ${(String(data.work_type || '').toLowerCase().includes('electrical') || String(data.work_type || '').toLowerCase().includes('both')) ? `
+          ${panelNumbersText ? `
+          <div>
+            <div class="info-label">Panel Numbers</div>
+            <div class="info-value">${panelNumbersText}</div>
+          </div>
+          ` : ''}
+          ${systemNumbersText ? `
+          <div>
+            <div class="info-label">System Numbers</div>
+            <div class="info-value">${systemNumbersText}</div>
+          </div>
+          ` : ''}
+        ` : ''}
+        ${(mechanicalWorksText && (String(data.work_type || '').toLowerCase().includes('mechanical') || String(data.work_type || '').toLowerCase().includes('both'))) ? `
+        <div>
+          <div class="info-label">Mechanical Works</div>
+          <div class="info-value">${mechanicalWorksText}</div>
+        </div>
+        ` : ''}
+        ` : ''}
+        <div>
+          <div class="info-label">Supervisor</div>
+          <div class="info-value">${data.Foreman || '-'}</div>
+        </div>
+        <div>
+          <div class="info-label">Supervisor Phone Number</div>
+          <div class="info-value">${data.Foreman_Phone_Number || '-'}</div>
+        </div>
+        <div class="info-fullwidth">
+          <div class="info-label">Description of Activity</div>
+          <div class="info-value" style="font-weight: 700; color: #0f172a; margin-bottom: 8px;">${data.description_of_activity || data.descriptionOfActivity || '-'}</div>
+        </div>
+        <div class="info-fullwidth">
+          <div class="info-label">Tools Used</div>
+          <div class="info-value">${data.Tools || '-'}</div>
+        </div>
+        <div class="info-fullwidth">
+          <div class="info-label">Machinery Used</div>
+          <div class="info-value">${data.Machinery || '-'}</div>
+        </div>
+        <div class="info-fullwidth" style="margin-top: 10px;">
+          <div class="info-label">RAMS File Attachments</div>
+          ${attachmentsHtml}
+        </div>
+      </div>
+    </div>
+
+    <!-- Required PPE and Detailed Approvals & Notes Side-by-Side Row -->
+    <div class="two-col-grid" style="margin-bottom: 20px;">
+      <!-- Required PPE -->
+      <div class="dashboard-card" style="margin-bottom: 0;">
+        <div class="card-section-header">
+          <div class="card-section-title-wrap">
+            <span class="card-section-icon">
+              ${getCardHeaderIcon('check')}
+            </span>
+            <div>
+              <h2 class="card-section-title">Required PPE</h2>
+              <p class="card-section-subtitle">Mandatory safety equipment</p>
+            </div>
+          </div>
+        </div>
+        <div class="ppe-grid">
+          ${renderPpeCard('Eye Protection', imgEyeProtection, Number(data.eye_protection) === 1)}
+          ${renderPpeCard('Fall Protection', imgFallProtection, Number(data.fall_protection) === 1)}
+          ${renderPpeCard('Hearing Protection', imgHearingProtection, Number(data.hearing_protection) === 1)}
+          ${renderPpeCard('Respiratory Protection', imgRespiratoryProtection, Number(data.respiratory_protection) === 1)}
+        </div>
+        ${data.other_ppe ? `
+          <div class="mt-3">
+            <div class="info-label">Other PPE</div>
+            <div class="info-value">${data.other_ppe}</div>
           </div>
         ` : ''}
-        
-        <!-- Location & Schedule -->
-        <div class="dashboard-card">
-          <div class="card-section-header">
-            <div class="card-section-title-wrap">
-              <span class="card-section-icon">
-                ${getCardHeaderIcon('location')}
-              </span>
-              <div>
-                <h2 class="card-section-title">Location & Schedule</h2>
-                <p class="card-section-subtitle">Where and when the work occurs</p>
-              </div>
-            </div>
-          </div>
-          <div class="info-grid">
-            <div>
-              <div class="info-label">Building</div>
-              <div class="info-value">${data.building_name || '-'}</div>
-            </div>
-            <div>
-              <div class="info-label">Level</div>
-              <div class="info-value">${data.Room_Type || '-'}</div>
-            </div>
-            <div>
-              <div class="info-label">Zone</div>
-              <div class="info-value">${data.zone_name || '-'}</div>
-            </div>
-            <div>
-              <!-- Empty spacer to align the grid -->
-            </div>
-            <div class="info-fullwidth">
-              <div class="info-label">Specific Rooms</div>
-              <div class="info-value">${formatRooms(data.room_names || data.Room_Nos)}</div>
-            </div>
-            <div>
-              <div class="info-label">Date</div>
-              <div class="info-value">${formatDateOnly(data.Working_Date)}</div>
-            </div>
-            <div>
-              <div class="info-label">Time</div>
-              <div class="info-value">${formatTimeOnly(data.Start_Time)} - ${formatTimeOnly(data.End_Time)}</div>
-            </div>
-            <div>
-              <div class="info-label">Shift Type</div>
-              <div class="info-value">${Number(data.night_shift) === 1 ? 'Night Shift' : 'Day Shift'}</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Work Details & Resources -->
-        <div class="dashboard-card">
-          <div class="card-section-header">
-            <div class="card-section-title-wrap">
-              <span class="card-section-icon">
-                ${getCardHeaderIcon('tools')}
-              </span>
-              <div>
-                <h2 class="card-section-title">Work Details & Resources</h2>
-                <p class="card-section-subtitle">Contractors, tools, and machinery</p>
-              </div>
-            </div>
-          </div>
-          <div class="info-grid">
-            <div class="info-fullwidth">
-              <div class="info-label">Description of Activity</div>
-              <div class="info-value" style="font-weight: 700; color: #0f172a; margin-bottom: 8px;">${data.description_of_activity || data.descriptionOfActivity || '-'}</div>
-            </div>
-            <div>
-              <div class="info-label">Contractor</div>
-              <div class="info-value">${data.subContractorName || data.Company_Name || '-'}</div>
-            </div>
-            <div>
-              <div class="info-label">Supervisor</div>
-              <div class="info-value">${data.Foreman || '-'}</div>
-            </div>
-            <div class="info-fullwidth">
-              <div class="info-label">Tools Used</div>
-              <div class="info-value">${data.Tools || '-'}</div>
-            </div>
-            <div class="info-fullwidth">
-              <div class="info-label">Machinery Used</div>
-              <div class="info-value">${data.Machinery || '-'}</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Safety Precautions & Notes -->
-        <div class="dashboard-card">
-          <div class="card-section-header">
-            <div class="card-section-title-wrap">
-              <span class="card-section-icon">
-                ${getCardHeaderIcon('safety')}
-              </span>
-              <div>
-                <h2 class="card-section-title">Safety Precautions & Notes</h2>
-                <p class="card-section-subtitle">Special instructions for this task</p>
-              </div>
-            </div>
-          </div>
-          
-          ${data.resolvedPrecautions && data.resolvedPrecautions.length > 0 ? `
-            <div class="precautions-card">
-              <div class="precautions-content">
-                <ul>
-                  ${data.resolvedPrecautions.map((p: string) => `<li>${p}</li>`).join('')}
-                </ul>
-              </div>
-            </div>
-          ` : ''}
-
-          ${notesHtml}
-        </div>
-
-
       </div>
 
-      <!-- Right Column -->
-      <div>
-        
-        <!-- Active Hazards -->
-        <div class="dashboard-card">
-          <div class="card-section-header">
-            <div class="card-section-title-wrap">
-              <span class="card-section-icon">
-                ${getCardHeaderIcon('hazards')}
-              </span>
-              <div>
-                <h2 class="card-section-title">Active Hazards</h2>
-                <p class="card-section-subtitle">Identified risks for this permit</p>
-              </div>
-            </div>
+      <!-- Detailed Approvals & Notes -->
+      <div class="dashboard-card" style="margin-bottom: 0;">
+        <div class="detailed-section-title">
+          Detailed Approvals & Notes
+        </div>
+        <div class="row">
+          <div class="col-md-6">
+            ${approvalsHtml}
+            <div class="info-label mt-2">The person responsible for this work</div>
+            <div class="info-value">${data.ConM_initials1 || 'N/A'}</div>
           </div>
-          <div class="active-hazards-list">
-            ${renderActiveHazardCards()}
+          <div class="col-md-6">
+            <div class="info-label">Reject Reason</div>
+            <div class="info-value mb-2">${data.reject_reason || 'N/A'}</div>
+            <div class="info-label">Cancel Reason</div>
+            <div class="info-value mb-2">${data.cancel_reason || 'N/A'}</div>
+            <div class="info-label">Close Note</div>
+            <div class="info-value">${data.close_note || 'N/A'}</div>
           </div>
         </div>
-
-        <!-- Required PPE -->
-        <div class="dashboard-card">
-          <div class="card-section-header">
-            <div class="card-section-title-wrap">
-              <span class="card-section-icon">
-                ${getCardHeaderIcon('check')}
-              </span>
-              <div>
-                <h2 class="card-section-title">Required PPE</h2>
-                <p class="card-section-subtitle">Mandatory safety equipment</p>
-              </div>
-            </div>
-          </div>
-          <div class="ppe-grid">
-            ${renderPpeCard('Eye Protection', imgEyeProtection, Number(data.eye_protection) === 1)}
-            ${renderPpeCard('Fall Protection', imgFallProtection, Number(data.fall_protection) === 1)}
-            ${renderPpeCard('Hearing Protection', imgHearingProtection, Number(data.hearing_protection) === 1)}
-            ${renderPpeCard('Respiratory Protection', imgRespiratoryProtection, Number(data.respiratory_protection) === 1)}
-          </div>
-          ${data.other_ppe ? `
-            <div class="mt-3">
-              <div class="info-label">Other PPE</div>
-              <div class="info-value">${data.other_ppe}</div>
-            </div>
-          ` : ''}
-        </div>
-
-
-
-        <!-- Attachments -->
-        <div class="dashboard-card">
-          <div class="card-section-header">
-            <div class="card-section-title-wrap">
-              <span class="card-section-icon">
-                ${getCardHeaderIcon('attachments')}
-              </span>
-              <div>
-                <h2 class="card-section-title">Attachments</h2>
-                <p class="card-section-subtitle">Documents and images</p>
-              </div>
-            </div>
-          </div>
-          <div class="attachments-grid">
-            ${attachmentsHtml}
-          </div>
-        </div>
-
-        <!-- Metadata -->
-        <div class="dashboard-card">
-          <div class="card-section-header">
-            <div class="card-section-title-wrap">
-              <span class="card-section-icon">
-                ${getCardHeaderIcon('metadata')}
-              </span>
-              <div>
-                <h2 class="card-section-title">Metadata</h2>
-                <p class="card-section-subtitle">System tracking details</p>
-              </div>
-            </div>
-          </div>
-          <div class="metadata-rows">
-            <div class="metadata-row">
-              <span class="metadata-label">Created By:</span>
-              <span class="metadata-value">System / ${data.created_by_user || 'Alex Mercer'}</span>
-            </div>
-            <div class="metadata-row">
-              <span class="metadata-label">Created Date:</span>
-              <span class="metadata-value">${formatDateOnly(data.Request_Date)}</span>
-            </div>
-            <div class="metadata-row">
-              <span class="metadata-label">Last Updated:</span>
-              <span class="metadata-value">${formatDateOnly(data.createdTime || data.Request_Date)}</span>
-            </div>
-            <div class="metadata-row">
-              <span class="metadata-label">Owner:</span>
-              <span class="metadata-value">${data.subContractorName || data.Company_Name || 'Apex Construction'}</span>
-            </div>
-          </div>
-        </div>
-
       </div>
-
     </div>
 
     <!-- HRA Detailed Checklists Section (Appended at the bottom) -->
@@ -2055,13 +2278,14 @@ export function generatePermitHtml(data: any): string {
       <!-- Hotwork Checklist Table -->
       ${(() => {
       const isHotWorkActive = Number(data.Hot_work) === 1;
-      const isWeldingActive = isHotWorkActive && Number(data.welding_activitiy) === 1;
+      const weldingVal = data.welding_activity ?? data.welding_activitiy ?? data.NEWHOTWORK ?? 0;
+      const isWeldingActive = isHotWorkActive && Number(weldingVal) === 1;
       if (!isHotWorkActive) {
         return `
           <div class="dashboard-card" style="border-left: 4px solid #ef4444; background-color: #fafafa; opacity: 0.9;">
             <div class="detailed-section-title" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0; display: flex; justify-content: space-between; align-items: center; width: 100%;">
               <div style="display: flex; align-items: center;">
-                ${imgHotWorks ? `<img src="${imgHotWorks}" style="height: 32px; vertical-align: middle; margin-right: 8px; filter: grayscale(100%);">` : ''}
+                ${imgHotWorks ? `<img src="${imgHotWorks}" style="height: 32px; vertical-align: middle; margin-right: 8px;">` : ''}
                 <span style="color: #64748b;">Hotwork Checklist</span>
               </div>
               <span class="badge" style="background-color: #fee2e2; color: #ef4444; border: 1px solid #fecaca; padding: 4px 12px; border-radius: 6px; font-size: 13px; font-weight: 800;">No</span>
@@ -2143,23 +2367,37 @@ export function generatePermitHtml(data: any): string {
             </div>
           </div>
 
-          <div class="mt-4 border-top pt-3">
-            <table class="detailed-table">
-              <tbody>
-                ${renderCheckRow('Has the work area been inspected for smoldering materials or residual heat?', data.h_heat_source)}
-                ${renderCheckRow('Have all tools and hot work equipment been safely removed from the work area?', data.h_workplace_check)}
-                ${renderCheckRow('Has the area been cleaned and restored to its original safe condition?', data.h_fire_detectors)}
-                <tr>
-                  <td>1hr Check time</td>
-                  <td colspan="3">${data.h_start_time && data.h_start_time !== '1970' ? data.h_start_time : 'N/A'}</td>
-                </tr>
-                <tr>
-                  <td>3hrs Check time</td>
-                  <td colspan="3">${data.h_end_time && data.h_end_time !== '1970' ? data.h_end_time : 'N/A'}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+          ${(() => {
+            const isClosedStatus = String(data.Request_status || data.requestStatus || '').toLowerCase() === 'closed';
+            if (!isClosedStatus) return '';
+            return `
+              <div class="mt-4 border-top pt-3">
+                <table class="detailed-table">
+                  <thead>
+                    <tr>
+                      <th>Closing Workplace Check</th>
+                      <th class="check-cell">Yes</th>
+                      <th class="check-cell">No</th>
+                      <th class="check-cell">N/A</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${renderCheckRow('Has the work area been inspected for smoldering materials or residual heat?', data.h_heat_source)}
+                    ${renderCheckRow('Have all tools and hot work equipment been safely removed from the work area?', data.h_workplace_check)}
+                    ${renderCheckRow('Has the area been cleaned and restored to its original safe condition?', data.h_fire_detectors)}
+                    <tr>
+                      <td>1hr Check time</td>
+                      <td colspan="3">${data.h_start_time && data.h_start_time !== '1970' ? data.h_start_time : 'N/A'}</td>
+                    </tr>
+                    <tr>
+                      <td>3hrs Check time</td>
+                      <td colspan="3">${data.h_end_time && data.h_end_time !== '1970' ? data.h_end_time : 'N/A'}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            `;
+          })()}
         </div>
       `;
     })()}
@@ -2172,7 +2410,7 @@ export function generatePermitHtml(data: any): string {
           <div class="dashboard-card" style="border-left: 4px solid #ef4444; background-color: #fafafa; opacity: 0.9;">
             <div class="detailed-section-title" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0; display: flex; justify-content: space-between; align-items: center; width: 100%;">
               <div style="display: flex; align-items: center;">
-                ${imgElectricalSystems ? `<img src="${imgElectricalSystems}" style="height: 32px; vertical-align: middle; margin-right: 8px; filter: grayscale(100%);">` : ''}
+                ${imgElectricalSystems ? `<img src="${imgElectricalSystems}" style="height: 32px; vertical-align: middle; margin-right: 8px;">` : ''}
                 <span style="color: #64748b;">Temporary Site Electrical Systems</span>
               </div>
               <span class="badge" style="background-color: #fee2e2; color: #ef4444; border: 1px solid #fecaca; padding: 4px 12px; border-radius: 6px; font-size: 13px; font-weight: 800;">No</span>
@@ -2214,7 +2452,7 @@ export function generatePermitHtml(data: any): string {
           <div class="dashboard-card" style="border-left: 4px solid #ef4444; background-color: #fafafa; opacity: 0.9;">
             <div class="detailed-section-title" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0; display: flex; justify-content: space-between; align-items: center; width: 100%;">
               <div style="display: flex; align-items: center;">
-                ${imgSubstanceChemical ? `<img src="${imgSubstanceChemical}" style="height: 32px; vertical-align: middle; margin-right: 8px; filter: grayscale(100%);">` : ''}
+                ${imgSubstanceChemical ? `<img src="${imgSubstanceChemical}" style="height: 32px; vertical-align: middle; margin-right: 8px;">` : ''}
                 <span style="color: #64748b;">Working with Hazardous Substances/Chemicals</span>
               </div>
               <span class="badge" style="background-color: #fee2e2; color: #ef4444; border: 1px solid #fecaca; padding: 4px 12px; border-radius: 6px; font-size: 13px; font-weight: 800;">No</span>
@@ -2257,7 +2495,7 @@ export function generatePermitHtml(data: any): string {
           <div class="dashboard-card" style="border-left: 4px solid #ef4444; background-color: #fafafa; opacity: 0.9;">
             <div class="detailed-section-title" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0; display: flex; justify-content: space-between; align-items: center; width: 100%;">
               <div style="display: flex; align-items: center;">
-                ${imgTestingEquipment ? `<img src="${imgTestingEquipment}" style="height: 32px; vertical-align: middle; margin-right: 8px; filter: grayscale(100%);">` : ''}
+                ${imgTestingEquipment ? `<img src="${imgTestingEquipment}" style="height: 32px; vertical-align: middle; margin-right: 8px;">` : ''}
                 <span style="color: #64748b;">Pressure Testing of Equipment</span>
               </div>
               <span class="badge" style="background-color: #fee2e2; color: #ef4444; border: 1px solid #fecaca; padding: 4px 12px; border-radius: 6px; font-size: 13px; font-weight: 800;">No</span>
@@ -2299,7 +2537,7 @@ export function generatePermitHtml(data: any): string {
           <div class="dashboard-card" style="border-left: 4px solid #ef4444; background-color: #fafafa; opacity: 0.9;">
             <div class="detailed-section-title" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0; display: flex; justify-content: space-between; align-items: center; width: 100%;">
               <div style="display: flex; align-items: center;">
-                ${imgWorkingAtHight ? `<img src="${imgWorkingAtHight}" style="height: 32px; vertical-align: middle; margin-right: 8px; filter: grayscale(100%);">` : ''}
+                ${imgWorkingAtHight ? `<img src="${imgWorkingAtHight}" style="height: 32px; vertical-align: middle; margin-right: 8px;">` : ''}
                 <span style="color: #64748b;">Working at Height</span>
               </div>
               <span class="badge" style="background-color: #fee2e2; color: #ef4444; border: 1px solid #fecaca; padding: 4px 12px; border-radius: 6px; font-size: 13px; font-weight: 800;">No</span>
@@ -2341,7 +2579,7 @@ export function generatePermitHtml(data: any): string {
           <div class="dashboard-card" style="border-left: 4px solid #ef4444; background-color: #fafafa; opacity: 0.9;">
             <div class="detailed-section-title" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0; display: flex; justify-content: space-between; align-items: center; width: 100%;">
               <div style="display: flex; align-items: center;">
-                ${imgConfinedSpace ? `<img src="${imgConfinedSpace}" style="height: 32px; vertical-align: middle; margin-right: 8px; filter: grayscale(100%);">` : ''}
+                ${imgConfinedSpace ? `<img src="${imgConfinedSpace}" style="height: 32px; vertical-align: middle; margin-right: 8px;">` : ''}
                 <span style="color: #64748b;">Working in Confined Space</span>
               </div>
               <span class="badge" style="background-color: #fee2e2; color: #ef4444; border: 1px solid #fecaca; padding: 4px 12px; border-radius: 6px; font-size: 13px; font-weight: 800;">No</span>
@@ -2383,7 +2621,7 @@ export function generatePermitHtml(data: any): string {
           <div class="dashboard-card" style="border-left: 4px solid #ef4444; background-color: #fafafa; opacity: 0.9;">
             <div class="detailed-section-title" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0; display: flex; justify-content: space-between; align-items: center; width: 100%;">
               <div style="display: flex; align-items: center;">
-                ${imgExcavationWorks ? `<img src="${imgExcavationWorks}" style="height: 32px; vertical-align: middle; margin-right: 8px; filter: grayscale(100%);">` : ''}
+                ${imgExcavationWorks ? `<img src="${imgExcavationWorks}" style="height: 32px; vertical-align: middle; margin-right: 8px;">` : ''}
                 <span style="color: #64748b;">Excavation Works</span>
               </div>
               <span class="badge" style="background-color: #fee2e2; color: #ef4444; border: 1px solid #fecaca; padding: 4px 12px; border-radius: 6px; font-size: 13px; font-weight: 800;">No</span>
@@ -2425,7 +2663,7 @@ export function generatePermitHtml(data: any): string {
           <div class="dashboard-card" style="border-left: 4px solid #ef4444; background-color: #fafafa; opacity: 0.9;">
             <div class="detailed-section-title" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0; display: flex; justify-content: space-between; align-items: center; width: 100%;">
               <div style="display: flex; align-items: center;">
-                ${imgCranesLifting ? `<img src="${imgCranesLifting}" style="height: 32px; vertical-align: middle; margin-right: 8px; filter: grayscale(100%);">` : ''}
+                ${imgCranesLifting ? `<img src="${imgCranesLifting}" style="height: 32px; vertical-align: middle; margin-right: 8px;">` : ''}
                 <span style="color: #64748b;">Crane and Lifting Operations</span>
               </div>
               <span class="badge" style="background-color: #fee2e2; color: #ef4444; border: 1px solid #fecaca; padding: 4px 12px; border-radius: 6px; font-size: 13px; font-weight: 800;">No</span>
@@ -2471,7 +2709,7 @@ export function generatePermitHtml(data: any): string {
           <div class="dashboard-card" style="border-left: 4px solid #ef4444; background-color: #fafafa; opacity: 0.9;">
             <div class="detailed-section-title" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0; display: flex; justify-content: space-between; align-items: center; width: 100%;">
               <div style="display: flex; align-items: center;">
-                ${imgElectricalWorks ? `<img src="${imgElectricalWorks}" style="height: 32px; vertical-align: middle; margin-right: 8px; filter: grayscale(100%);">` : ''}
+                ${imgElectricalWorks ? `<img src="${imgElectricalWorks}" style="height: 32px; vertical-align: middle; margin-right: 8px;">` : ''}
                 <span style="color: #64748b;">Energising, Isolating & Working on Live Electrical Systems</span>
               </div>
               <span class="badge" style="background-color: #fee2e2; color: #ef4444; border: 1px solid #fecaca; padding: 4px 12px; border-radius: 6px; font-size: 13px; font-weight: 800;">No</span>
@@ -2567,7 +2805,7 @@ export function generatePermitHtml(data: any): string {
           <div class="dashboard-card" style="border-left: 4px solid #ef4444; background-color: #fafafa; opacity: 0.9;">
             <div class="detailed-section-title" style="margin-bottom: 0; border-bottom: none; padding-bottom: 0; display: flex; justify-content: space-between; align-items: center; width: 100%;">
               <div style="display: flex; align-items: center;">
-                ${imgMechanicalWorks ? `<img src="${imgMechanicalWorks}" style="height: 32px; vertical-align: middle; margin-right: 8px; filter: grayscale(100%);">` : ''}
+                ${imgMechanicalWorks ? `<img src="${imgMechanicalWorks}" style="height: 32px; vertical-align: middle; margin-right: 8px;">` : ''}
                 <span style="color: #64748b;">Energisation of Mechanical equipment</span>
               </div>
               <span class="badge" style="background-color: #fee2e2; color: #ef4444; border: 1px solid #fecaca; padding: 4px 12px; border-radius: 6px; font-size: 13px; font-weight: 800;">No</span>
@@ -2603,26 +2841,31 @@ export function generatePermitHtml(data: any): string {
 
 
 
-      <!-- Approvals and Notes original signoffs -->
+      <!-- Safety Precautions & Notes -->
       <div class="dashboard-card">
-        <div class="detailed-section-title">
-          Detailed Approvals & Notes
-        </div>
-        <div class="row">
-          <div class="col-md-6">
-            ${approvalsHtml}
-            <div class="info-label mt-2">The person responsible for this work</div>
-            <div class="info-value">${data.ConM_initials1 || 'N/A'}</div>
-          </div>
-          <div class="col-md-6">
-            <div class="info-label">Reject Reason</div>
-            <div class="info-value mb-2">${data.reject_reason || 'N/A'}</div>
-            <div class="info-label">Cancel Reason</div>
-            <div class="info-value mb-2">${data.cancel_reason || 'N/A'}</div>
-            <div class="info-label">Close Note</div>
-            <div class="info-value">${data.close_note || 'N/A'}</div>
+        <div class="card-section-header">
+          <div class="card-section-title-wrap">
+            <span class="card-section-icon">
+              ${getCardHeaderIcon('safety')}
+            </span>
+            <div>
+              <h2 class="card-section-title">Safety Precautions & Notes</h2>
+              <p class="card-section-subtitle">Special instructions for this task</p>
+            </div>
           </div>
         </div>
+        
+        ${data.resolvedPrecautions && data.resolvedPrecautions.length > 0 ? `
+          <div class="precautions-card">
+            <div class="precautions-content">
+              <ul>
+                ${data.resolvedPrecautions.map((p: string) => `<li>${p}</li>`).join('')}
+              </ul>
+            </div>
+          </div>
+        ` : ''}
+
+        ${notesHtml}
       </div>
 
       <!-- Upload Images Section (For Checkin/Checkout Picture popups) -->
@@ -2633,6 +2876,39 @@ export function generatePermitHtml(data: any): string {
         <div class="row">
           ${imagesHtml}
         </div>
+      </div>
+
+      <!-- Details of Persons Attending Toolbox Talk Table -->
+      <div class="dashboard-card">
+        <div class="card-section-header" style="margin-bottom: 16px; border-bottom: none; padding-bottom: 0;">
+          <div class="card-section-title-wrap">
+            <span class="card-section-icon" style="color: #4f46e5;">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" style="width: 20px; height: 20px;">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M18 18.72a9.094 9.094 0 003.741-.479 3 3 0 00-4.682-2.72m.94 3.198.001.031c0 .225-.012.447-.037.666A11.944 11.944 0 0112 21c-2.17 0-4.207-.576-5.963-1.584A6.062 6.062 0 016 18.719m12 0a5.971 5.971 0 00-.941-3.197m0 0A5.995 5.995 0 0012 12.75a5.995 5.995 0 00-5.058 2.772m0 0a3 3 0 00-4.681 2.72 8.986 8.986 0 003.74.477m.94-3.197a5.971 5.971 0 00-.94 3.197M15 6.75a3 3 0 11-6 0 3 3 0 016 0zm6 3a2.25 2.25 0 11-4.5 0 2.25 2.25 0 014.5 0zm-13.5 0a2.25 2.25 0 11-4.5 0 2.25 2.25 0 014.5 0z" />
+              </svg>
+            </span>
+            <div>
+              <h2 class="card-section-title" style="font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; color: #1e293b;">Details of Persons Attending Toolbox Talk</h2>
+            </div>
+          </div>
+        </div>
+        
+        <table style="width: 100%; border-collapse: collapse; font-family: 'Mulish', sans-serif; font-size: 13px; color: #334155; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; page-break-inside: avoid;">
+          <thead>
+            <tr style="background-color: #f1f5f9; border-bottom: 1px solid #e2e8f0;">
+              <th style="width: 50%; padding: 12px 16px; font-weight: 600; text-align: left; border-right: 1px solid #e2e8f0; color: #475569;">Date/Time:</th>
+              <th style="width: 50%; padding: 12px 16px; font-weight: 600; text-align: left; color: #475569;">Toolbox Conducted by:</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${Array.from({ length: 8 }).map((_, i) => `
+              <tr style="background-color: ${i % 2 === 0 ? '#ffffff' : '#f8fafc'}; border-bottom: 1px solid #e2e8f0;">
+                <td style="padding: 14px 16px; border-right: 1px solid #e2e8f0; color: #94a3b8; font-weight: 500; height: 45px; vertical-align: middle;">Name:</td>
+                <td style="padding: 14px 16px; color: #94a3b8; font-weight: 500; height: 45px; vertical-align: middle;">Signature:</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
       </div>
 
     </div>
@@ -2649,45 +2925,9 @@ export function generatePermitHtml(data: any): string {
   <!-- BootStrap & pdf generation scripts -->
   <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/js/bootstrap.bundle.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
   <script>
     function test() {
-      // Hide buttons and controls before capture to keep the PDF clean
-      const downloadContainer = document.querySelector('.confirm-pg-download-container');
-      const headerActions = document.querySelector('.header-actions');
-      const backBtn = document.querySelector('.back-btn');
-      
-      if (downloadContainer) downloadContainer.style.display = 'none';
-      if (headerActions) headerActions.style.display = 'none';
-      if (backBtn) backBtn.style.display = 'none';
-
-      var element = document.getElementById('root');
-      var name = "${data.PermitNo || 'Permit'}" + ".pdf";
-      var opt = {
-        margin: [10, 10, 10, 10],
-        filename: name,
-        image: { type: 'jpeg', quality: 0.98 },
-        html2canvas: { 
-          scale: 2, 
-          useCORS: true,
-          windowWidth: 1280,
-          scrollX: 0,
-          scrollY: 0
-        },
-        jsPDF: {
-          unit: 'mm',
-          format: 'a4',
-          orientation: 'portrait'
-        },
-        pagebreak: { mode: ['avoid-all', 'css', 'legacy'] }
-      };
-      
-      html2pdf().set(opt).from(element).save().then(function() {
-        // Restore controls visibility once download is completed
-        if (downloadContainer) downloadContainer.style.display = 'block';
-        if (headerActions) headerActions.style.display = 'flex';
-        if (backBtn) backBtn.style.display = 'flex';
-      });
+      window.location.href = "/requests/permit-design/${data.PermitNo}/pdf";
     }
   </script>
 </body>

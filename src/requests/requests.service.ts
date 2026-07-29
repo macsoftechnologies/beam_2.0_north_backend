@@ -1,10 +1,11 @@
 import { Injectable, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, In } from 'typeorm';
+import { Repository, In, Brackets, DeepPartial } from 'typeorm';
 import * as fs from 'fs';
 import * as path from 'path';
 import { RedisCacheService } from 'src/redis/redid-cache.service';
+import { NotificationsService } from '../notifications/notifications.service';
 
 import { RequestEntity } from './entities/request.entity';
 import {
@@ -117,6 +118,7 @@ export class RequestsService {
     @InjectRepository(ElectricalWork)
     private readonly electricalWorkRepo: Repository<ElectricalWork>,
     private readonly redisCacheService: RedisCacheService,
+    private readonly notificationsService: NotificationsService,
   ) { }
 
   private areEqual(val1: any, val2: any): boolean {
@@ -452,8 +454,10 @@ export class RequestsService {
 
     const permitNo = await this.generatePermitNo();
 
+    const isNightShift = String(dto.night_shift) === '1' || String(dto.night_shift) === 'true';
+
     // 1. Save Request
-    const requestObj = this.requestRepo.create({
+    const requestData: DeepPartial<RequestEntity> = {
       userId: dto.userId,
       companyName: dto.Company_Name,
       permitNo: permitNo,
@@ -487,14 +491,24 @@ export class RequestsService {
       siteId: dto.Site_Id !== undefined ? dto.Site_Id : 5,
       permitType: dto.permit_type,
       permitUnder: dto.permit_under || 'Construction',
-      newDate: dto.new_date,
-      newEndTime: dto.new_end_time,
-      nightShift: dto.night_shift,
+      newDate: isNightShift ? (dto.new_date && dto.new_date !== 'none' ? dto.new_date : '') : '',
+      newEndTime: isNightShift ? (dto.new_end_time && dto.new_end_time !== 'none' ? dto.new_end_time : '') : '',
+      nightShift: isNightShift ? '1' : '0',
       safetyPrecautions: dto.Safety_Precautions,
-    });
+    };
 
+    const requestObj = this.requestRepo.create(requestData);
     const savedRequest = await this.requestRepo.save(requestObj);
     const requestId = savedRequest.id;
+
+    if (savedRequest.requestStatus) {
+      this.notificationsService.triggerNotification(
+        savedRequest.id,
+        null,
+        savedRequest.requestStatus,
+        savedRequest.userId ?? 0,
+      ).catch((err) => console.error('Notification error:', err));
+    }
 
     // 2. Insert into all 13 sub-tables
     await this.chemicalRepo.save(
@@ -689,6 +703,7 @@ export class RequestsService {
         lanyardAttachments: dto.lanyard_attachments || 0,
         rescuePlan: dto.rescue_plan || 0,
         avoidHazards: dto.avoid_hazards || 0,
+        heightTraining: dto.height_training || 0,
         heightEquipments: dto.height_equipments || 0,
         supervision: dto.supervision || 0,
         shockAbsorbing: dto.shock_absorbing || 0,
@@ -736,7 +751,10 @@ export class RequestsService {
         pipeworkMic: dto.pipework_mic || 0,
         lotoPlanAttached: dto.loto_plan_attached || 0,
         exclusionZoneCalculated: dto.exclusion_zone_calculated || 0,
-        pnematicHydrostatic: dto.pnematic_hydrostatic || 0,
+        pnematicHydrostatic:
+          dto.pnematic_hydrostatic !== undefined
+            ? dto.pnematic_hydrostatic
+            : dto.pneumatic_hydrostatic || 0,
         pressureOfTheTest: dto.pressure_of_the_test || '',
         safetyValvesCalibrated: dto.safety_valves_calibrated || 0,
         pressurePneumatic: dto.pressure_pneumatic || '',
@@ -1564,9 +1582,30 @@ export class RequestsService {
     }
     addIfChanged('permitType', dto.permit_type, existing.permitType);
     addIfChanged('permitUnder', dto.permit_under, existing.permitUnder);
-    addIfChanged('newDate', dto.new_date, existing.newDate);
-    addIfChanged('newEndTime', dto.new_end_time, existing.newEndTime);
-    addIfChanged('nightShift', dto.night_shift, existing.nightShift);
+
+    if (dto.night_shift !== undefined || dto.new_date !== undefined || dto.new_end_time !== undefined) {
+      const isNightShift = dto.night_shift !== undefined
+        ? (String(dto.night_shift) === '1' || String(dto.night_shift) === 'true')
+        : (String(existing.nightShift) === '1' || existing.nightShift === 'true');
+
+      if (isNightShift) {
+        const finalNewDate = dto.new_date !== undefined
+          ? (dto.new_date && dto.new_date !== 'none' ? dto.new_date : '')
+          : existing.newDate;
+
+        const finalNewEndTime = dto.new_end_time !== undefined
+          ? (dto.new_end_time && dto.new_end_time !== 'none' ? dto.new_end_time : '')
+          : existing.newEndTime;
+
+        addIfChanged('newDate', finalNewDate, existing.newDate);
+        addIfChanged('newEndTime', finalNewEndTime, existing.newEndTime);
+        addIfChanged('nightShift', '1', existing.nightShift);
+      } else {
+        addIfChanged('newDate', '', existing.newDate);
+        addIfChanged('newEndTime', '', existing.newEndTime);
+        addIfChanged('nightShift', '0', existing.nightShift);
+      }
+    }
     addIfChanged(
       'safetyPrecautions',
       dto.Safety_Precautions,
@@ -1575,6 +1614,18 @@ export class RequestsService {
 
     if (Object.keys(toUpdate).length > 0) {
       await this.requestRepo.update(id, toUpdate);
+    }
+
+    if (isStatusChanged) {
+      const newStatus = dto.Request_status !== undefined && dto.Request_status !== ''
+        ? dto.Request_status
+        : (dto.status === 1 ? 'Pending' : 'Cancelled');
+      this.notificationsService.triggerNotification(
+        id,
+        existing.requestStatus,
+        newStatus,
+        dto.userId ?? 0,
+      ).catch((err) => console.error('Notification error:', err));
     }
 
     // 2. Update sub-tables
@@ -1769,6 +1820,7 @@ export class RequestsService {
       lanyardAttachments: dto.lanyard_attachments,
       rescuePlan: dto.rescue_plan,
       avoidHazards: dto.avoid_hazards,
+      heightTraining: dto.height_training,
       heightEquipments: dto.height_equipments,
       supervision: dto.supervision,
       shockAbsorbing: dto.shock_absorbing,
@@ -1932,6 +1984,13 @@ export class RequestsService {
     Request_status?: string;
     status?: number;
     userId?: number;
+    initials?: string;
+    ConM_initials?: string;
+    CoMM_initials?: string;
+    ConM_initials1?: string;
+    reject_reason?: string;
+    cancel_reason?: string;
+    close_note?: string;
     Start_Time?: string;
     End_Time?: string;
     night_shift?: number;
@@ -1942,6 +2001,13 @@ export class RequestsService {
       Request_status,
       status,
       userId,
+      initials,
+      ConM_initials,
+      CoMM_initials,
+      ConM_initials1,
+      reject_reason,
+      cancel_reason,
+      close_note,
       Start_Time,
       End_Time,
       night_shift,
@@ -1998,6 +2064,20 @@ export class RequestsService {
         }
 
         if (targetStatus !== '') {
+          // Prevent setting to same status (status must move forward)
+          const currentStatusClean = (existing.requestStatus || '').trim().toLowerCase();
+          const targetStatusClean = (targetStatus || '').trim().toLowerCase();
+          const resolvedStatusClean = (resolvedStatus || '').trim().toLowerCase();
+
+          if (
+            targetStatusClean !== '' &&
+            (targetStatusClean === currentStatusClean || resolvedStatusClean === currentStatusClean)
+          ) {
+            throw new BadRequestException(
+              `Permit ${existing.permitNo ? existing.permitNo + ' ' : ''}is already in '${existing.requestStatus}' status.`,
+            );
+          }
+
           await this.validateStatusTransitionAndRole(existing, targetStatus, userId || 0);
           if (Request_status !== undefined) {
             updateData.requestStatus = resolvedStatus;
@@ -2005,6 +2085,98 @@ export class RequestsService {
           if (status !== undefined) {
             updateData.status = status;
           }
+        }
+
+        // 1b. Update extension subtable (initials, reasons, notes)
+        let ext = await this.extraMiscRepo.findOne({ where: { requestId: singleId } });
+        if (!ext) {
+          ext = this.extraMiscRepo.create({ requestId: singleId });
+        }
+
+        let isExtUpdated = false;
+
+        if (reject_reason !== undefined && reject_reason !== '') {
+          ext.rejectReason = reject_reason;
+          isExtUpdated = true;
+        }
+        if (cancel_reason !== undefined && cancel_reason !== '') {
+          ext.cancelReason = cancel_reason;
+          isExtUpdated = true;
+        }
+        if (close_note !== undefined && close_note !== '') {
+          ext.closeNote = close_note;
+          isExtUpdated = true;
+        }
+
+        const providedInitials = (initials || '').trim();
+        const providedConM = (ConM_initials || '').trim();
+        const providedCoMM = (CoMM_initials || '').trim();
+        const providedConM1 = (ConM_initials1 || '').trim();
+        const sig = providedInitials || providedConM || providedCoMM || providedConM1;
+
+        if (sig !== '') {
+          const nextStatus = resolvedStatus || targetStatus || existing.requestStatus || '';
+          if (nextStatus === 'Opened' || targetStatus === 'Opened') {
+            ext.conMInitials1 = providedConM1 || sig;
+            isExtUpdated = true;
+          }
+
+          const permitType = (existing.permitType || '').trim();
+          const permitUnder = (existing.permitUnder || '').trim();
+          const currentStatus = (existing.requestStatus || '').trim();
+
+          // Rule 1: Construction & Construction => ONLY ConM_initials (Direct approval)
+          if (permitType === 'Construction' && permitUnder === 'Construction') {
+            ext.conMInitials = providedConM || sig;
+            isExtUpdated = true;
+          }
+          // Rule 2: Commissioning & Commissioning => ONLY CoMM_initials (Direct approval)
+          else if (permitType === 'Commissioning' && permitUnder === 'Commissioning') {
+            ext.coMMInitials = providedCoMM || sig;
+            isExtUpdated = true;
+          }
+          // Rule 3: permit_under: Construction, permit_type: Commissioning
+          else if (permitUnder === 'Construction' && permitType === 'Commissioning') {
+            if (nextStatus === 'Pre-Approved' || currentStatus === 'Hold' || currentStatus === 'Pending') {
+              ext.conMInitials = providedConM || sig;
+              isExtUpdated = true;
+            } else if (nextStatus === 'Approved' || currentStatus === 'Pre-Approved') {
+              ext.coMMInitials = providedCoMM || sig;
+              isExtUpdated = true;
+            } else {
+              ext.conMInitials = providedConM || sig;
+              isExtUpdated = true;
+            }
+          }
+          // Rule 4: permit_under: Commissioning, permit_type: Construction
+          else if (permitUnder === 'Commissioning' && permitType === 'Construction') {
+            if (nextStatus === 'Pre-Approved' || currentStatus === 'Hold' || currentStatus === 'Pending') {
+              ext.coMMInitials = providedCoMM || sig;
+              isExtUpdated = true;
+            } else if (nextStatus === 'Approved' || currentStatus === 'Pre-Approved') {
+              ext.conMInitials = providedConM || sig;
+              isExtUpdated = true;
+            } else {
+              ext.coMMInitials = providedCoMM || sig;
+              isExtUpdated = true;
+            }
+          }
+          else {
+            if (providedConM) {
+              ext.conMInitials = providedConM;
+              isExtUpdated = true;
+            } else if (providedCoMM) {
+              ext.coMMInitials = providedCoMM;
+              isExtUpdated = true;
+            } else if (sig) {
+              ext.conMInitials = sig;
+              isExtUpdated = true;
+            }
+          }
+        }
+
+        if (isExtUpdated) {
+          await this.extraMiscRepo.save(ext);
         }
 
         // 2. Process Shift & Timing bulk edit if requested
@@ -2041,8 +2213,8 @@ export class RequestsService {
             if (End_Time !== undefined) {
               updateData.endTime = End_Time;
             }
-            updateData.newDate = null as any;
-            updateData.newEndTime = null as any;
+            updateData.newDate = '';
+            updateData.newEndTime = '';
           } else {
             // night_shift is not being changed, just updating start/end times
             const currentNightShift = existing.nightShift === '1';
@@ -2081,14 +2253,22 @@ export class RequestsService {
 
         // Create log if status changed
         if (targetStatus !== '') {
+          const finalStatus = resolvedStatus || (status === 1 ? 'Pending' : 'Cancelled');
           await this.createLogs(
             existing.id,
             userId || 0,
-            resolvedStatus || (status === 1 ? 'Pending' : 'Cancelled'),
+            finalStatus,
             new Date(),
             [],
             0,
           );
+
+          this.notificationsService.triggerNotification(
+            existing.id,
+            existing.requestStatus,
+            finalStatus,
+            userId || 0,
+          ).catch((err) => console.error('Notification error:', err));
         } else if (isTimeUpdate) {
           await this.createLogs(
             existing.id,
@@ -2120,6 +2300,41 @@ export class RequestsService {
       successfulIds: successfulUpdates,
       failed: failedUpdates,
     };
+  }
+
+  async updateSafety(body: { id: string; safety: string }): Promise<any> {
+    const { id, safety } = body;
+    if (!id) {
+      throw new BadRequestException('Missing required field: id');
+    }
+
+    const idsArray = id
+      .split(',')
+      .map((val) => Number(val.trim()))
+      .filter((val) => !isNaN(val));
+
+    // Parse the new precaution IDs the user selected
+    const newPrecautionIds = (safety || '')
+      .split(',')
+      .map((v) => v.trim())
+      .filter(Boolean);
+
+    // Fetch current safety precautions for all selected permits
+    const permits = await this.requestRepo.findBy({ id: In(idsArray) });
+
+    // For each permit, merge existing IDs with new IDs (union, no duplicates)
+    for (const permit of permits) {
+      const existingIds = (permit.safetyPrecautions || '')
+        .split(',')
+        .map((v) => v.trim())
+        .filter(Boolean);
+
+      const mergedIds = Array.from(new Set([...existingIds, ...newPrecautionIds]));
+      await this.requestRepo.update(permit.id, { safetyPrecautions: mergedIds.join(',') });
+    }
+
+    await this.redisCacheService.deleteByPattern('requests:*');
+    return { success: true, updatedCount: idsArray.length };
   }
 
   /**
@@ -2170,6 +2385,154 @@ export class RequestsService {
     return roomNos; // Return raw value if not numeric
   }
 
+  private async resolveLevelFilters(
+    floorIdInput?: any,
+    roomTypeInput?: any,
+  ): Promise<{ resolvedFloorIds: number[]; resolvedFloorNames: string[]; rawTerms: string[] } | null> {
+    const rawTerms: string[] = [];
+
+    const extractItems = (val: any) => {
+      if (val === undefined || val === null || val === '') return;
+      if (Array.isArray(val)) {
+        val.forEach((item) => extractItems(item));
+      } else if (typeof val === 'string') {
+        val.split(',').forEach((s) => {
+          const cleaned = s.replace(/'/g, '').trim();
+          if (cleaned && cleaned !== '0') rawTerms.push(cleaned);
+        });
+      } else if (typeof val === 'number' && !isNaN(val) && val !== 0) {
+        rawTerms.push(String(val));
+      }
+    };
+
+    extractItems(floorIdInput);
+    extractItems(roomTypeInput);
+
+    if (rawTerms.length === 0) return null;
+
+    const directFloorIds: number[] = [];
+    const nameTerms: string[] = [];
+
+    rawTerms.forEach((term) => {
+      if (/^\d+$/.test(term)) {
+        directFloorIds.push(Number(term));
+      } else {
+        nameTerms.push(term);
+      }
+    });
+
+    const floorIdsSet = new Set<number>(directFloorIds);
+    const floorNamesSet = new Set<string>(nameTerms);
+
+    if (directFloorIds.length > 0) {
+      try {
+        const foundFloors = await this.floorRepo.findBy({
+          fl_id: In(directFloorIds),
+        });
+        foundFloors.forEach((f) => {
+          if (f && f.floor_name) {
+            floorNamesSet.add(f.floor_name.trim());
+          }
+        });
+      } catch (e) {}
+    }
+
+    if (nameTerms.length > 0) {
+      for (const nTerm of nameTerms) {
+        try {
+          const matchingFloors = await this.floorRepo
+            .createQueryBuilder('f')
+            .where('f.floor_name LIKE :name', { name: `%${nTerm}%` })
+            .getMany();
+          matchingFloors.forEach((f) => {
+            if (f && f.fl_id) floorIdsSet.add(f.fl_id);
+            if (f && f.floor_name) floorNamesSet.add(f.floor_name.trim());
+          });
+        } catch (e) {}
+      }
+    }
+
+    return {
+      resolvedFloorIds: Array.from(floorIdsSet),
+      resolvedFloorNames: Array.from(floorNamesSet),
+      rawTerms: Array.from(new Set(rawTerms)),
+    };
+  }
+
+  private async resolveZoneFilters(
+    zoneIdsInput?: any,
+    zoneIdInput?: any,
+    zoneInput?: any,
+  ): Promise<{ selectedZoneIds: number[]; zoneNames: string[] } | null> {
+    const rawZoneTerms: string[] = [];
+
+    const extractZoneItems = (val: any) => {
+      if (val === undefined || val === null || val === '') return;
+      if (Array.isArray(val)) {
+        val.forEach((item) => extractZoneItems(item));
+      } else if (typeof val === 'string') {
+        val.split(',').forEach((s) => {
+          const cleaned = s.replace(/'/g, '').trim();
+          if (cleaned) rawZoneTerms.push(cleaned);
+        });
+      } else if (typeof val === 'number' && !isNaN(val)) {
+        rawZoneTerms.push(String(val));
+      }
+    };
+
+    extractZoneItems(zoneIdsInput);
+    extractZoneItems(zoneIdInput);
+    extractZoneItems(zoneInput);
+
+    if (rawZoneTerms.length === 0) return null;
+
+    const directIds: number[] = [];
+    const nameTerms: string[] = [];
+
+    rawZoneTerms.forEach((term) => {
+      if (/^\d+$/.test(term)) {
+        directIds.push(Number(term));
+      } else {
+        nameTerms.push(term);
+      }
+    });
+
+    const resolvedZoneIdsSet = new Set<number>(directIds);
+    const resolvedZoneNamesSet = new Set<string>(nameTerms);
+
+    if (nameTerms.length > 0) {
+      for (const nTerm of nameTerms) {
+        try {
+          const matchingZones = await this.zoneRepo
+            .createQueryBuilder('z')
+            .where('z.zone LIKE :zName', { zName: `%${nTerm}%` })
+            .getMany();
+          matchingZones.forEach((z) => {
+            if (z.id) resolvedZoneIdsSet.add(z.id);
+            if (z.zone) resolvedZoneNamesSet.add(z.zone.trim());
+          });
+        } catch (e) {}
+      }
+    }
+
+    if (directIds.length > 0) {
+      try {
+        const foundZones = await this.zoneRepo.findBy({ id: In(directIds) });
+        foundZones.forEach((z) => {
+          if (z.zone) resolvedZoneNamesSet.add(z.zone.trim());
+        });
+      } catch (e) {}
+    }
+
+    const selectedZoneIds = Array.from(resolvedZoneIdsSet);
+    const zoneNames = Array.from(new Set([...resolvedZoneNamesSet, ...nameTerms]));
+
+    return {
+      selectedZoneIds,
+      zoneNames,
+    };
+  }
+
   /**
    * Resolves a Floor_Id search term (numeric ID or floor name) to an array of floor IDs.
    * Returns null when the input is empty/falsy (meaning no filter should be applied).
@@ -2206,42 +2569,103 @@ export class RequestsService {
   ): Promise<string[] | null> {
     if (
       !roomIdOrName ||
-      roomIdOrName.trim() === '' ||
-      roomIdOrName.trim() === '0'
+      String(roomIdOrName).trim() === '' ||
+      String(roomIdOrName).trim() === '0'
     )
       return null;
 
-    const parts = roomIdOrName.split(',').map((p) => p.trim()).filter(Boolean);
+    const parts = String(roomIdOrName)
+      .split(/[|,]/)
+      .map((p) => p.replace(/'/g, '').trim())
+      .filter(Boolean);
+
     if (parts.length === 0) return null;
 
     const terms: Set<string> = new Set();
+    const numericIds: number[] = [];
+    const nameParts: string[] = [];
 
     for (const part of parts) {
-      terms.add(part); // Always include the raw part
+      terms.add(part);
       if (/^\d+$/.test(part)) {
-        // Numeric input – look up the room name so we can also match by name
-        const room = await this.roomRepo.findOne({
-          where: { room_id: Number(part) },
-        });
-        if (room) {
-          terms.add(room.room_name);
-        }
+        numericIds.push(Number(part));
       } else {
-        // Name input – look up matching rooms so we can also match stored IDs
-        const rooms = await this.roomRepo
-          .createQueryBuilder('r')
-          .where('r.room_name LIKE :name', { name: `%${part}%` })
-          .getMany();
-        rooms.forEach((r) => {
-          terms.add(String(r.room_id));
-          terms.add(r.room_name);
+        nameParts.push(part);
+      }
+    }
+
+    if (numericIds.length > 0) {
+      try {
+        const foundRooms = await this.roomRepo.find({
+          where: { room_id: In(numericIds) },
         });
+        foundRooms.forEach((r) => {
+          if (r && r.room_name) {
+            terms.add(r.room_name.trim());
+          }
+        });
+      } catch (err) {
+        for (const id of numericIds) {
+          try {
+            const room = await this.roomRepo.findOne({ where: { room_id: id } });
+            if (room && room.room_name) terms.add(room.room_name.trim());
+          } catch {}
+        }
+      }
+    }
+
+    if (nameParts.length > 0) {
+      for (const nPart of nameParts) {
+        try {
+          const matchingRooms = await this.roomRepo
+            .createQueryBuilder('r')
+            .where('r.room_name LIKE :name', { name: `%${nPart}%` })
+            .getMany();
+          matchingRooms.forEach((r) => {
+            terms.add(String(r.room_id));
+            if (r && r.room_name) terms.add(r.room_name.trim());
+          });
+        } catch {}
       }
     }
 
     return [...terms];
   }
 
+
+  private parseIdList(input: any): number[] {
+    if (input === undefined || input === null || input === '' || input === 0 || input === '0') {
+      return [];
+    }
+    if (Array.isArray(input)) {
+      return input
+        .map(item => Number(String(item).replace(/'/g, '').trim()))
+        .filter(num => !isNaN(num) && num !== 0);
+    }
+    const str = String(input).replace(/'/g, '').trim();
+    if (!str) return [];
+    return str
+      .split(',')
+      .map(item => Number(item.trim()))
+      .filter(num => !isNaN(num) && num !== 0);
+  }
+
+  private parseStringList(input: any): string[] {
+    if (input === undefined || input === null || input === '') {
+      return [];
+    }
+    if (Array.isArray(input)) {
+      return input
+        .map(item => String(item).replace(/'/g, '').trim())
+        .filter(Boolean);
+    }
+    const str = String(input).replace(/'/g, '').trim();
+    if (!str) return [];
+    return str
+      .split(',')
+      .map(item => item.trim().replace(/^'|'$/g, ''))
+      .filter(Boolean);
+  }
 
   // Search/Filter Requests
   async search(dto: SearchRequestDto, loggedInUserId?: number): Promise<any> {
@@ -2399,135 +2823,161 @@ export class RequestsService {
           });
         }
         if (dto.Request_status) {
-          const statusList = dto.Request_status.split(',').map(s => s.trim());
-          if (statusList.length > 1) {
-            qb.andWhere('requests.Request_status IN (:...requestStatuses)', {
-              requestStatuses: statusList,
-            });
-          } else {
-            const singleStatus = statusList[0];
-            if (singleStatus === 'Auto-Cancelled') {
-              qb.andWhere('extraMisc.cancelReason = :cancelReason', {
-                cancelReason: 'Permit not opened so system cancelled automatically',
-              });
-            } else if (singleStatus === 'Cancelled') {
-              qb.andWhere('requests.Request_status = :requestStatus', {
-                requestStatus: singleStatus,
-              });
-              qb.andWhere(
-                '(extraMisc.cancelReason IS NULL OR extraMisc.cancelReason != :autoCancelMsg)',
-                { autoCancelMsg: 'Permit not opened so system cancelled automatically' },
-              );
-            } else {
-              qb.andWhere('requests.Request_status = :requestStatus', {
-                requestStatus: singleStatus,
-              });
-            }
+          const rawStatus = String(dto.Request_status).replace(/'/g, '').trim();
+          const statusList = rawStatus
+            .split(',')
+            .map((s) => s.trim().replace(/^'|'$/g, ''))
+            .filter(Boolean);
+
+          if (statusList.length > 0) {
+            qb.andWhere(
+              new Brackets((statusQb) => {
+                statusList.forEach((st, idx) => {
+                  const paramName = `reqStatus_${idx}`;
+                  const autoCancelMsgParam = `autoCancelMsg_${idx}`;
+                  if (st === 'Auto-Cancelled') {
+                    const autoCancelCond = `(requests.Request_status = :${paramName} OR extraMisc.cancelReason = :${autoCancelMsgParam})`;
+                    const params = {
+                      [paramName]: 'Auto-Cancelled',
+                      [autoCancelMsgParam]: 'Permit not opened so system cancelled automatically',
+                    };
+                    if (idx === 0) {
+                      statusQb.where(autoCancelCond, params);
+                    } else {
+                      statusQb.orWhere(autoCancelCond, params);
+                    }
+                  } else if (st === 'Cancelled') {
+                    const cancelCond = `(requests.Request_status = :${paramName} AND (extraMisc.cancelReason IS NULL OR extraMisc.cancelReason != :${autoCancelMsgParam}))`;
+                    const params = {
+                      [paramName]: 'Cancelled',
+                      [autoCancelMsgParam]: 'Permit not opened so system cancelled automatically',
+                    };
+                    if (idx === 0) {
+                      statusQb.where(cancelCond, params);
+                    } else {
+                      statusQb.orWhere(cancelCond, params);
+                    }
+                  } else {
+                    const normalCond = `requests.Request_status = :${paramName}`;
+                    const params = { [paramName]: st };
+                    if (idx === 0) {
+                      statusQb.where(normalCond, params);
+                    } else {
+                      statusQb.orWhere(normalCond, params);
+                    }
+                  }
+                });
+              }),
+            );
           }
         }
         if (
           dto.Site_Id !== undefined &&
           dto.Site_Id !== null &&
-          Number(dto.Site_Id) !== 0
+          Number(String(dto.Site_Id).replace(/'/g, '').trim()) !== 0
         ) {
-          qb.andWhere('requests.Site_Id = :siteId', { siteId: dto.Site_Id });
+          qb.andWhere('requests.Site_Id = :siteId', { siteId: Number(String(dto.Site_Id).replace(/'/g, '').trim()) });
         }
-        if (
-          dto.Building_Id !== undefined &&
-          dto.Building_Id !== null &&
-          Number(dto.Building_Id) !== 0
-        ) {
-          qb.andWhere('requests.Building_Id = :buildingId', {
-            buildingId: dto.Building_Id,
+        const buildingIds = this.parseIdList(dto.Building_Id);
+        if (buildingIds.length > 1) {
+          qb.andWhere('requests.Building_Id IN (:...buildingIds)', { buildingIds });
+        } else if (buildingIds.length === 1) {
+          qb.andWhere('requests.Building_Id = :buildingId', { buildingId: buildingIds[0] });
+        }
+
+        // Level / Floor filtering (supports single or multi-level, floor IDs or floor names, across old & new DB records)
+        const levelRes = await this.resolveLevelFilters(dto.Floor_Id, dto.Room_Type);
+        if (levelRes) {
+          const { resolvedFloorIds, resolvedFloorNames, rawTerms } = levelRes;
+          const allTerms = Array.from(new Set([...resolvedFloorNames, ...rawTerms]));
+          if (resolvedFloorIds.length > 0 || allTerms.length > 0) {
+            qb.andWhere(
+              new Brackets((levelQb) => {
+                let hasCondition = false;
+                if (resolvedFloorIds.length > 0) {
+                  levelQb.where('requests.Floor_Id IN (:...resolvedFloorIds)', { resolvedFloorIds });
+                  hasCondition = true;
+                }
+                allTerms.forEach((fTerm, idx) => {
+                  const paramName = `fTerm_${idx}`;
+                  if (hasCondition) {
+                    levelQb.orWhere(`requests.Room_Type LIKE :${paramName}`, { [paramName]: `%${fTerm}%` });
+                  } else {
+                    levelQb.where(`requests.Room_Type LIKE :${paramName}`, { [paramName]: `%${fTerm}%` });
+                    hasCondition = true;
+                  }
+                });
+              }),
+            );
+          } else {
+            qb.andWhere('1 = 0');
+          }
+        }
+
+        const zoneRes = await this.resolveZoneFilters(dto.zoneIds, dto.Zone_Id, dto.zone);
+        if (zoneRes) {
+          const { selectedZoneIds, zoneNames } = zoneRes;
+          if (selectedZoneIds.length > 0 || zoneNames.length > 0) {
+            qb.andWhere(
+              new Brackets((zoneQb) => {
+                let hasCond = false;
+                if (selectedZoneIds.length > 0) {
+                  zoneQb.where('requests.Zone_Id IN (:...selectedZoneIds)', { selectedZoneIds });
+                  hasCond = true;
+                }
+
+                zoneNames.forEach((zName, index) => {
+                  const paramName = `zName_${index}`;
+                  if (hasCond) {
+                    zoneQb.orWhere(`requests.zone LIKE :${paramName}`, { [paramName]: `%${zName}%` });
+                  } else {
+                    zoneQb.where(`requests.zone LIKE :${paramName}`, { [paramName]: `%${zName}%` });
+                    hasCond = true;
+                  }
+                });
+              }),
+            );
+          } else {
+            qb.andWhere('1 = 0');
+          }
+        }
+
+        // Support both area and Room_Nos search terms with strict token boundary matching
+        const roomSearchVal = dto.Room_Nos !== undefined && dto.Room_Nos !== null && String(dto.Room_Nos).trim() !== ''
+          ? String(dto.Room_Nos)
+          : (dto.area !== undefined && dto.area !== null && String(dto.area).trim() !== '' ? String(dto.area) : '');
+
+        if (roomSearchVal !== '' && roomSearchVal !== '0') {
+          const roomTerms = await this.resolveRoomSearchTerms(roomSearchVal);
+          if (roomTerms && roomTerms.length > 0) {
+            const escapedTerms = roomTerms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+            const regexPattern = `(^|,[[:space:]]*)(${escapedTerms.join('|')})([[:space:]]*,|$)`;
+            qb.andWhere(`requests.Room_Nos REGEXP :roomRegex`, { roomRegex: regexPattern });
+          } else {
+            qb.andWhere('1 = 0');
+          }
+        }
+
+        const subContractorIds = this.parseIdList(dto.Sub_Contractor_Id);
+        if (subContractorIds.length > 1) {
+          qb.andWhere('requests.Sub_Contractor_Id IN (:...subContractorIds)', {
+            subContractorIds,
           });
-        }
-
-        // Floor_Id: support both numeric ID and floor name string
-        if (
-          dto.Floor_Id !== undefined &&
-          dto.Floor_Id !== null &&
-          String(dto.Floor_Id).trim() !== '' &&
-          String(dto.Floor_Id).trim() !== '0'
-        ) {
-          const floorIds = await this.resolveFloorIds(String(dto.Floor_Id));
-          if (floorIds !== null) {
-            if (floorIds.length > 0) {
-              qb.andWhere('requests.Floor_Id IN (:...floorIds)', { floorIds });
-            } else {
-              // No floors matched the name – return no results for this filter
-              qb.andWhere('1 = 0');
-            }
-          }
-        }
-
-        if (
-          dto.Zone_Id !== undefined &&
-          dto.Zone_Id !== null &&
-          Number(dto.Zone_Id) !== 0
-        ) {
-          qb.andWhere('requests.Zone_Id = :zoneId', { zoneId: dto.Zone_Id });
-        }
-
-        if (
-          dto.zone !== undefined &&
-          dto.zone !== null &&
-          dto.zone.trim() !== ''
-        ) {
-          qb.andWhere('requests.zone LIKE :zone', { zone: `%${dto.zone.trim()}%` });
-        }
-
-        // Room_Nos: support both numeric room ID and room name string
-        // Because Room_Nos is a comma-separated text column we use LIKE conditions.
-        // We resolve the search term to all possible IDs + names then OR them together.
-        if (
-          dto.Room_Nos !== undefined &&
-          dto.Room_Nos !== null &&
-          String(dto.Room_Nos).trim() !== '' &&
-          String(dto.Room_Nos).trim() !== '0'
-        ) {
-          const roomTerms = await this.resolveRoomSearchTerms(
-            String(dto.Room_Nos),
-          );
-          if (roomTerms !== null) {
-            if (roomTerms.length > 0) {
-              const roomConditions = roomTerms
-                .map((_, idx) => `requests.Room_Nos LIKE :roomTerm${idx}`)
-                .join(' OR ');
-              const roomParams: Record<string, string> = {};
-              roomTerms.forEach((t, idx) => {
-                roomParams[`roomTerm${idx}`] = `%${t}%`;
-              });
-              qb.andWhere(`(${roomConditions})`, roomParams);
-            } else {
-              // No rooms matched – return no results
-              qb.andWhere('1 = 0');
-            }
-          }
-        }
-
-        if (
-          dto.Sub_Contractor_Id !== undefined &&
-          dto.Sub_Contractor_Id !== null &&
-          Number(dto.Sub_Contractor_Id) !== 0
-        ) {
+        } else if (subContractorIds.length === 1) {
           qb.andWhere('requests.Sub_Contractor_Id = :subContractorId', {
-            subContractorId: dto.Sub_Contractor_Id,
+            subContractorId: subContractorIds[0],
           });
         }
         if (
           dto.Type_Of_Activity_Id !== undefined &&
           dto.Type_Of_Activity_Id !== null &&
-          Number(dto.Type_Of_Activity_Id) !== 0
+          Number(String(dto.Type_Of_Activity_Id).replace(/'/g, '').trim()) !== 0
         ) {
           qb.andWhere('requests.Type_Of_Activity_Id = :typeOfActivityId', {
-            typeOfActivityId: dto.Type_Of_Activity_Id,
+            typeOfActivityId: Number(String(dto.Type_Of_Activity_Id).replace(/'/g, '').trim()),
           });
         }
-        if (dto.Room_Type) {
-          qb.andWhere('requests.Room_Type = :roomType', {
-            roomType: dto.Room_Type,
-          });
-        }
+
         if (dto.permit_type) {
           qb.andWhere('requests.permit_type = :permitType', {
             permitType: dto.permit_type,
@@ -2538,10 +2988,16 @@ export class RequestsService {
             permitUnder: dto.permit_under,
           });
         }
-        if (dto.night_shift) {
-          qb.andWhere('requests.night_shift = :nightShift', {
-            nightShift: dto.night_shift,
-          });
+        if (dto.night_shift !== undefined && dto.night_shift !== null && String(dto.night_shift).trim() !== '') {
+          const nsVal = String(dto.night_shift).trim();
+          if (nsVal === '1' || nsVal === 'true') {
+            qb.andWhere('(requests.night_shift = :nsOne OR requests.night_shift = 1)', { nsOne: '1' });
+          } else if (nsVal === '0' || nsVal === 'false') {
+            qb.andWhere(
+              '(requests.night_shift = :nsZero OR requests.night_shift = 0 OR requests.night_shift IS NULL OR requests.night_shift = :nsEmpty)',
+              { nsZero: '0', nsEmpty: '' },
+            );
+          }
         }
         if (dto.new_date) {
           qb.andWhere('requests.new_date = :newDate', {
@@ -2582,133 +3038,97 @@ export class RequestsService {
           }
         }
 
-        // Safety Flag Filters (requires joining sub-tables) - only filter when explicitly set to 1
-        if (
-          dto.Hot_work !== undefined &&
-          dto.Hot_work !== null &&
-          Number(dto.Hot_work) === 1
-        ) {
-          qb.andWhere('fireHotwork.Hot_work = :hotWork', {
-            hotWork: dto.Hot_work,
-          });
+        // Safety Flag Filters (requires joining sub-tables) - group multi-selected HRAs with OR
+        const activeHraConds: string[] = [];
+        if (dto.Hot_work !== undefined && dto.Hot_work !== null && Number(dto.Hot_work) === 1) {
+          activeHraConds.push('fireHotwork.Hot_work = 1');
         }
-        if (
-          dto.working_on_electrical_system !== undefined &&
-          dto.working_on_electrical_system !== null &&
-          Number(dto.working_on_electrical_system) === 1
-        ) {
-          qb.andWhere('electrical.working_on_electrical_system = :workElec', {
-            workElec: dto.working_on_electrical_system,
-          });
+        if (dto.working_on_electrical_system !== undefined && dto.working_on_electrical_system !== null && Number(dto.working_on_electrical_system) === 1) {
+          activeHraConds.push('electrical.working_on_electrical_system = 1');
         }
-        if (
-          dto.working_hazardious_substen !== undefined &&
-          dto.working_hazardious_substen !== null &&
-          Number(dto.working_hazardious_substen) === 1
-        ) {
-          qb.andWhere('chemical.working_hazardious_substen = :workHaz', {
-            workHaz: dto.working_hazardious_substen,
-          });
+        if (dto.working_hazardious_substen !== undefined && dto.working_hazardious_substen !== null && Number(dto.working_hazardious_substen) === 1) {
+          activeHraConds.push('chemical.working_hazardious_substen = 1');
         }
-        if (
-          dto.using_cranes_or_lifting !== undefined &&
-          dto.using_cranes_or_lifting !== null &&
-          Number(dto.using_cranes_or_lifting) === 1
-        ) {
-          qb.andWhere('lifting.using_cranes_or_lifting = :useCrane', {
-            useCrane: dto.using_cranes_or_lifting,
-          });
+        if (dto.using_cranes_or_lifting !== undefined && dto.using_cranes_or_lifting !== null && Number(dto.using_cranes_or_lifting) === 1) {
+          activeHraConds.push('lifting.using_cranes_or_lifting = 1');
         }
-        if (
-          dto.pressure_tesing_of_equipment !== undefined &&
-          dto.pressure_tesing_of_equipment !== null &&
-          Number(dto.pressure_tesing_of_equipment) === 1
-        ) {
-          qb.andWhere(
-            'pressureTesting.pressure_testing_of_equipment = :pressTest',
-            { pressTest: dto.pressure_tesing_of_equipment },
-          );
+        if (dto.pressure_tesing_of_equipment !== undefined && dto.pressure_tesing_of_equipment !== null && Number(dto.pressure_tesing_of_equipment) === 1) {
+          activeHraConds.push('pressureTesting.pressure_testing_of_equipment = 1');
         }
-        if (
-          dto.working_at_height !== undefined &&
-          dto.working_at_height !== null &&
-          Number(dto.working_at_height) === 1
-        ) {
-          qb.andWhere('height.working_at_height = :workHeight', {
-            workHeight: dto.working_at_height,
-          });
+        if (dto.working_at_height !== undefined && dto.working_at_height !== null && Number(dto.working_at_height) === 1) {
+          activeHraConds.push('height.working_at_height = 1');
         }
-        if (
-          dto.working_confined_spaces !== undefined &&
-          dto.working_confined_spaces !== null &&
-          Number(dto.working_confined_spaces) === 1
-        ) {
-          qb.andWhere('confined.working_confined_spaces = :workConf', {
-            workConf: dto.working_confined_spaces,
-          });
+        if (dto.working_confined_spaces !== undefined && dto.working_confined_spaces !== null && Number(dto.working_confined_spaces) === 1) {
+          activeHraConds.push('confined.working_confined_spaces = 1');
         }
-        if (
-          dto.specific_gloves !== undefined &&
-          dto.specific_gloves !== null &&
-          Number(dto.specific_gloves) === 1
-        ) {
-          qb.andWhere('ppe.specific_gloves = :specGloves', {
-            specGloves: dto.specific_gloves,
-          });
+        if (dto.power_on !== undefined && dto.power_on !== null && Number(dto.power_on) === 1) {
+          activeHraConds.push('energisingElectrical.power_on = 1');
         }
-        if (
-          dto.eye_protection !== undefined &&
-          dto.eye_protection !== null &&
-          Number(dto.eye_protection) === 1
-        ) {
-          qb.andWhere('ppe.eye_protection = :eyeProt', {
-            eyeProt: dto.eye_protection,
-          });
+        if (dto.pressurization !== undefined && dto.pressurization !== null && Number(dto.pressurization) === 1) {
+          activeHraConds.push('energisingMechanical.pressurization = 1');
         }
-        if (
-          dto.fall_protection !== undefined &&
-          dto.fall_protection !== null &&
-          Number(dto.fall_protection) === 1
-        ) {
-          qb.andWhere('ppe.fall_protection = :fallProt', {
-            fallProt: dto.fall_protection,
-          });
+        if (dto.excavation_works !== undefined && dto.excavation_works !== null && Number(dto.excavation_works) === 1) {
+          activeHraConds.push('excavation.excavation_works = 1');
         }
-        if (
-          dto.hearing_protection !== undefined &&
-          dto.hearing_protection !== null &&
-          Number(dto.hearing_protection) === 1
-        ) {
-          qb.andWhere('ppe.hearing_protection = :hearProt', {
-            hearProt: dto.hearing_protection,
-          });
+
+        if (activeHraConds.length > 0) {
+          qb.andWhere(`(${activeHraConds.join(' OR ')})`);
         }
-        if (
-          dto.respiratory_protection !== undefined &&
-          dto.respiratory_protection !== null &&
-          Number(dto.respiratory_protection) === 1
-        ) {
-          qb.andWhere('ppe.respiratory_protection = :respProt', {
-            respProt: dto.respiratory_protection,
-          });
+
+        // PPE Equipment Filters
+        if (dto.specific_gloves !== undefined && dto.specific_gloves !== null && Number(dto.specific_gloves) === 1) {
+          qb.andWhere('ppe.specific_gloves = 1');
         }
-        if (
-          dto.power_on !== undefined &&
-          dto.power_on !== null &&
-          Number(dto.power_on) === 1
-        ) {
-          qb.andWhere('energisingElectrical.power_on = :powerOn', {
-            powerOn: dto.power_on,
-          });
+        if (dto.eye_protection !== undefined && dto.eye_protection !== null && Number(dto.eye_protection) === 1) {
+          qb.andWhere('ppe.eye_protection = 1');
         }
+        if (dto.fall_protection !== undefined && dto.fall_protection !== null && Number(dto.fall_protection) === 1) {
+          qb.andWhere('ppe.fall_protection = 1');
+        }
+        if (dto.hearing_protection !== undefined && dto.hearing_protection !== null && Number(dto.hearing_protection) === 1) {
+          qb.andWhere('ppe.hearing_protection = 1');
+        }
+        if (dto.respiratory_protection !== undefined && dto.respiratory_protection !== null && Number(dto.respiratory_protection) === 1) {
+          qb.andWhere('ppe.respiratory_protection = 1');
+        }
+
         if (
-          dto.pressurization !== undefined &&
-          dto.pressurization !== null &&
-          Number(dto.pressurization) === 1
+          dto.hras !== undefined &&
+          dto.hras !== null &&
+          String(dto.hras).trim() !== ''
         ) {
-          qb.andWhere('energisingMechanical.pressurization = :pressur', {
-            pressur: dto.pressurization,
-          });
+          const hrasVal = Number(dto.hras);
+          if (hrasVal === 0) {
+            qb.andWhere(
+              '(fireHotwork.Hot_work IS NULL OR fireHotwork.Hot_work = 0 OR fireHotwork.Hot_work = :zeroStr) ' +
+              'AND (electrical.working_on_electrical_system IS NULL OR electrical.working_on_electrical_system = 0 OR electrical.working_on_electrical_system = :zeroStr) ' +
+              'AND (chemical.working_hazardious_substen IS NULL OR chemical.working_hazardious_substen = 0 OR chemical.working_hazardious_substen = :zeroStr) ' +
+              'AND (pressureTesting.pressure_testing_of_equipment IS NULL OR pressureTesting.pressure_testing_of_equipment = 0 OR pressureTesting.pressure_testing_of_equipment = :zeroStr) ' +
+              'AND (height.working_at_height IS NULL OR height.working_at_height = 0 OR height.working_at_height = :zeroStr) ' +
+              'AND (confined.working_confined_spaces IS NULL OR confined.working_confined_spaces = 0 OR confined.working_confined_spaces = :zeroStr) ' +
+              'AND (excavation.excavation_works IS NULL OR excavation.excavation_works = 0 OR excavation.excavation_works = :zeroStr) ' +
+              'AND (lifting.using_cranes_or_lifting IS NULL OR lifting.using_cranes_or_lifting = 0 OR lifting.using_cranes_or_lifting = :zeroStr) ' +
+              'AND (energisingElectrical.power_on IS NULL OR energisingElectrical.power_on = 0 OR energisingElectrical.power_on = :zeroStr) ' +
+              'AND (energisingMechanical.pressurization IS NULL OR energisingMechanical.pressurization = 0 OR energisingMechanical.pressurization = :zeroStr)',
+              { zeroStr: '0' }
+            );
+          } else if (hrasVal === 1) {
+            const hasSpecificHraFilter = [
+              dto.Hot_work, dto.working_on_electrical_system, dto.working_hazardious_substen,
+              dto.using_cranes_or_lifting, dto.pressure_tesing_of_equipment, dto.working_at_height,
+              dto.working_confined_spaces, dto.power_on, dto.pressurization, dto.excavation_works
+            ].some(v => v !== undefined && v !== null && Number(v) === 1);
+
+            if (!hasSpecificHraFilter) {
+              qb.andWhere(
+                '(fireHotwork.Hot_work = 1 OR electrical.working_on_electrical_system = 1 OR ' +
+                'chemical.working_hazardious_substen = 1 OR pressureTesting.pressure_testing_of_equipment = 1 OR ' +
+                'height.working_at_height = 1 OR confined.working_confined_spaces = 1 OR ' +
+                'excavation.excavation_works = 1 OR lifting.using_cranes_or_lifting = 1 OR ' +
+                'energisingElectrical.power_on = 1 OR energisingMechanical.pressurization = 1)'
+              );
+            }
+          }
         }
 
         // Sorting and Pagination
@@ -2858,7 +3278,7 @@ export class RequestsService {
       'work_in_atex_area', 'securing_facilities', 'excavation_works',
       'specific_gloves', 'eye_protection', 'fall_protection', 'hearing_protection',
       'respiratory_protection', 'taskSpecificPPE', 'power_on', 'pressurization',
-      'fromDate', 'toDate', 'Start_Time', 'End_Time'
+      'fromDate', 'toDate', 'Start_Time', 'End_Time', 'Zone_Id', 'zone', 'zoneIds', 'Room_Nos', 'Floor_Id', 'Type_Of_Activity_Id', 'PermitNo', 'Activity'
     ];
     const filteredSearchDto: PlanSearchDto = {};
     for (const key of allowedKeys) {
@@ -2890,13 +3310,7 @@ export class RequestsService {
     searchDto = filteredSearchDto;
 
     const subContractorId = await this.getSubcontractorIdForUser(loggedInUserId);
-    const key = subContractorId
-      ? `requests:plans:${JSON.stringify(searchDto)}:subcon:${subContractorId}`
-      : `requests:plans:${JSON.stringify(searchDto)}`;
-    return this.redisCacheService.getOrSet(
-      key,
-      async () => {
-        // --- Week parsing ---
+    // --- Week parsing ---
         let weekStart: string | null = null;
         let weekEnd: string | null = null;
         let weekValue: string | null = null;
@@ -2939,6 +3353,14 @@ export class RequestsService {
             fromDate: searchDto.from_date,
             toDate: searchDto.to_date,
           });
+        } else if (searchDto.from_date) {
+          qb.andWhere('DATE(requests.Working_Date) >= :fromDate', {
+            fromDate: searchDto.from_date,
+          });
+        } else if (searchDto.to_date) {
+          qb.andWhere('DATE(requests.Working_Date) <= :toDate', {
+            toDate: searchDto.to_date,
+          });
         }
 
         // Only apply Year/Month if Week is NOT provided
@@ -2963,16 +3385,47 @@ export class RequestsService {
         if (searchDto.Site_Id && Number(searchDto.Site_Id) !== 0) {
           qb.andWhere('requests.Site_Id = :siteId', { siteId: searchDto.Site_Id });
         }
-        if (searchDto.Building_Id && Number(searchDto.Building_Id) !== 0) {
-          qb.andWhere('requests.Building_Id = :buildingId', { buildingId: searchDto.Building_Id });
+        const planBuildingIds = this.parseIdList(searchDto.Building_Id);
+        if (planBuildingIds.length > 1) {
+          qb.andWhere('requests.Building_Id IN (:...planBuildingIds)', { planBuildingIds });
+        } else if (planBuildingIds.length === 1) {
+          qb.andWhere('requests.Building_Id = :buildingId', { buildingId: planBuildingIds[0] });
         }
-        if (subContractorId) {
+        const planSubconIds = this.parseIdList(searchDto.Sub_Contractor_Id);
+        if (planSubconIds.length > 1) {
+          qb.andWhere('requests.Sub_Contractor_Id IN (:...planSubconIds)', { planSubconIds });
+        } else if (planSubconIds.length === 1) {
+          qb.andWhere('requests.Sub_Contractor_Id = :subContractorId', { subContractorId: planSubconIds[0] });
+        } else if (subContractorId) {
           qb.andWhere('requests.Sub_Contractor_Id = :subContractorId', { subContractorId });
-        } else if (searchDto.Sub_Contractor_Id && Number(searchDto.Sub_Contractor_Id) !== 0) {
-          qb.andWhere('requests.Sub_Contractor_Id = :subContractorId', { subContractorId: searchDto.Sub_Contractor_Id });
         }
-        if (searchDto.Room_Type) {
-          qb.andWhere('requests.Room_Type = :roomType', { roomType: searchDto.Room_Type });
+        // Level / Floor filtering (supports single or multi-level, floor IDs or floor names, across old & new DB records)
+        const planLevelRes = await this.resolveLevelFilters(searchDto.Floor_Id, searchDto.Room_Type);
+        if (planLevelRes) {
+          const { resolvedFloorIds, resolvedFloorNames, rawTerms } = planLevelRes;
+          const allTerms = Array.from(new Set([...resolvedFloorNames, ...rawTerms]));
+          if (resolvedFloorIds.length > 0 || allTerms.length > 0) {
+            qb.andWhere(
+              new Brackets((levelQb) => {
+                let hasCondition = false;
+                if (resolvedFloorIds.length > 0) {
+                  levelQb.where('requests.Floor_Id IN (:...resolvedFloorIds)', { resolvedFloorIds });
+                  hasCondition = true;
+                }
+                allTerms.forEach((fTerm, idx) => {
+                  const paramName = `fTerm_${idx}`;
+                  if (hasCondition) {
+                    levelQb.orWhere(`requests.Room_Type LIKE :${paramName}`, { [paramName]: `%${fTerm}%` });
+                  } else {
+                    levelQb.where(`requests.Room_Type LIKE :${paramName}`, { [paramName]: `%${fTerm}%` });
+                    hasCondition = true;
+                  }
+                });
+              }),
+            );
+          } else {
+            qb.andWhere('1 = 0');
+          }
         }
         if (searchDto.start_time) {
           qb.andWhere('requests.Start_Time = :startTime', { startTime: searchDto.start_time });
@@ -2980,8 +3433,19 @@ export class RequestsService {
         if (searchDto.end_time) {
           qb.andWhere('requests.End_Time = :endTime', { endTime: searchDto.end_time });
         }
-        if (searchDto.area) {
-          qb.andWhere('requests.area = :area', { area: searchDto.area });
+        const planRoomSearchVal = searchDto.Room_Nos !== undefined && searchDto.Room_Nos !== null && String(searchDto.Room_Nos).trim() !== ''
+          ? String(searchDto.Room_Nos)
+          : (searchDto.area !== undefined && searchDto.area !== null && String(searchDto.area).trim() !== '' ? String(searchDto.area) : '');
+
+        if (planRoomSearchVal !== '' && planRoomSearchVal !== '0') {
+          const roomTerms = await this.resolveRoomSearchTerms(planRoomSearchVal);
+          if (roomTerms && roomTerms.length > 0) {
+            const escapedTerms = roomTerms.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+            const regexPattern = `(^|,[[:space:]]*)(${escapedTerms.join('|')})([[:space:]]*,|$)`;
+            qb.andWhere(`requests.Room_Nos REGEXP :roomRegex`, { roomRegex: regexPattern });
+          } else {
+            qb.andWhere('1 = 0');
+          }
         }
         if (searchDto.permit_type) {
           qb.andWhere('requests.permit_type = :permitType', { permitType: searchDto.permit_type });
@@ -2989,8 +3453,35 @@ export class RequestsService {
         if (searchDto.permit_under) {
           qb.andWhere('requests.permit_under = :permitUnder', { permitUnder: searchDto.permit_under });
         }
-        if (searchDto.night_shift) {
-          qb.andWhere('requests.night_shift = :nightShift', { nightShift: searchDto.night_shift });
+        if (
+          searchDto.Type_Of_Activity_Id !== undefined &&
+          searchDto.Type_Of_Activity_Id !== null &&
+          Number(String(searchDto.Type_Of_Activity_Id).replace(/'/g, '').trim()) !== 0
+        ) {
+          qb.andWhere('requests.Type_Of_Activity_Id = :typeOfActivityId', {
+            typeOfActivityId: Number(String(searchDto.Type_Of_Activity_Id).replace(/'/g, '').trim()),
+          });
+        }
+        if (searchDto.PermitNo) {
+          qb.andWhere('requests.PermitNo LIKE :permitNo', {
+            permitNo: `%${searchDto.PermitNo}%`,
+          });
+        }
+        if (searchDto.Activity) {
+          qb.andWhere('requests.Activity LIKE :activityName', {
+            activityName: `%${searchDto.Activity}%`,
+          });
+        }
+        if (searchDto.night_shift !== undefined && searchDto.night_shift !== null && String(searchDto.night_shift).trim() !== '') {
+          const nsVal = String(searchDto.night_shift).trim();
+          if (nsVal === '1' || nsVal === 'true') {
+            qb.andWhere('(requests.night_shift = :nsOne OR requests.night_shift = 1)', { nsOne: '1' });
+          } else if (nsVal === '0' || nsVal === 'false') {
+            qb.andWhere(
+              '(requests.night_shift = :nsZero OR requests.night_shift = 0 OR requests.night_shift IS NULL OR requests.night_shift = :nsEmpty)',
+              { nsZero: '0', nsEmpty: '' },
+            );
+          }
         }
         if (searchDto.new_date) {
           qb.andWhere('requests.new_date = :newDate', { newDate: searchDto.new_date });
@@ -2998,30 +3489,119 @@ export class RequestsService {
         if (searchDto.new_end_time) {
           qb.andWhere('requests.new_end_time = :newEndTime', { newEndTime: searchDto.new_end_time });
         }
-        if (searchDto.hras) {
-          qb.andWhere('requests.hras = :hras', { hras: searchDto.hras });
+        if (
+          searchDto.hras !== undefined &&
+          searchDto.hras !== null &&
+          String(searchDto.hras).trim() !== ''
+        ) {
+          const hrasVal = Number(searchDto.hras);
+          if (hrasVal === 0) {
+            qb.andWhere(
+              '(fireHotwork.Hot_work IS NULL OR fireHotwork.Hot_work = 0 OR fireHotwork.Hot_work = :zeroStr) ' +
+              'AND (electrical.working_on_electrical_system IS NULL OR electrical.working_on_electrical_system = 0 OR electrical.working_on_electrical_system = :zeroStr) ' +
+              'AND (chemical.working_hazardious_substen IS NULL OR chemical.working_hazardious_substen = 0 OR chemical.working_hazardious_substen = :zeroStr) ' +
+              'AND (pressureTesting.pressure_testing_of_equipment IS NULL OR pressureTesting.pressure_testing_of_equipment = 0 OR pressureTesting.pressure_testing_of_equipment = :zeroStr) ' +
+              'AND (height.working_at_height IS NULL OR height.working_at_height = 0 OR height.working_at_height = :zeroStr) ' +
+              'AND (confined.working_confined_spaces IS NULL OR confined.working_confined_spaces = 0 OR confined.working_confined_spaces = :zeroStr) ' +
+              'AND (excavation.excavation_works IS NULL OR excavation.excavation_works = 0 OR excavation.excavation_works = :zeroStr) ' +
+              'AND (lifting.using_cranes_or_lifting IS NULL OR lifting.using_cranes_or_lifting = 0 OR lifting.using_cranes_or_lifting = :zeroStr) ' +
+              'AND (energisingElectrical.power_on IS NULL OR energisingElectrical.power_on = 0 OR energisingElectrical.power_on = :zeroStr) ' +
+              'AND (energisingMechanical.pressurization IS NULL OR energisingMechanical.pressurization = 0 OR energisingMechanical.pressurization = :zeroStr)',
+              { zeroStr: '0' }
+            );
+          } else if (hrasVal === 1) {
+            const hasSpecificHraFilter = [
+              searchDto.Hot_work, searchDto.working_on_electrical_system, searchDto.working_hazardious_substen,
+              searchDto.using_cranes_or_lifting, searchDto.pressure_tesing_of_equipment, searchDto.working_at_height,
+              searchDto.working_confined_spaces, searchDto.power_on, searchDto.pressurization, searchDto.excavation_works
+            ].some(v => v !== undefined && v !== null && Number(v) === 1);
+
+            if (!hasSpecificHraFilter) {
+              qb.andWhere(
+                '(fireHotwork.Hot_work = 1 OR electrical.working_on_electrical_system = 1 OR ' +
+                'chemical.working_hazardious_substen = 1 OR pressureTesting.pressure_testing_of_equipment = 1 OR ' +
+                'height.working_at_height = 1 OR confined.working_confined_spaces = 1 OR ' +
+                'excavation.excavation_works = 1 OR lifting.using_cranes_or_lifting = 1 OR ' +
+                'energisingElectrical.power_on = 1 OR energisingMechanical.pressurization = 1)'
+              );
+            }
+          }
         }
         if (searchDto.Request_status) {
-          const statusList = searchDto.Request_status.split(',').map(s => s.trim());
-          if (statusList.length > 1) {
-            qb.andWhere('requests.Request_status IN (:...requestStatuses)', {
-              requestStatuses: statusList,
-            });
+          const rawStatus = String(searchDto.Request_status).replace(/'/g, '').trim();
+          const statusList = rawStatus
+            .split(',')
+            .map((s) => s.trim().replace(/^'|'$/g, ''))
+            .filter(Boolean);
+
+          if (statusList.length > 0) {
+            qb.andWhere(
+              new Brackets((statusQb) => {
+                statusList.forEach((st, idx) => {
+                  const paramName = `reqPlanStatus_${idx}`;
+                  const autoCancelMsgParam = `autoCancelPlanMsg_${idx}`;
+                  if (st === 'Auto-Cancelled') {
+                    const autoCancelCond = `(requests.Request_status = :${paramName} OR extraMisc.cancelReason = :${autoCancelMsgParam})`;
+                    const params = {
+                      [paramName]: 'Auto-Cancelled',
+                      [autoCancelMsgParam]: 'Permit not opened so system cancelled automatically',
+                    };
+                    if (idx === 0) {
+                      statusQb.where(autoCancelCond, params);
+                    } else {
+                      statusQb.orWhere(autoCancelCond, params);
+                    }
+                  } else if (st === 'Cancelled') {
+                    const cancelCond = `(requests.Request_status = :${paramName} AND (extraMisc.cancelReason IS NULL OR extraMisc.cancelReason != :${autoCancelMsgParam}))`;
+                    const params = {
+                      [paramName]: 'Cancelled',
+                      [autoCancelMsgParam]: 'Permit not opened so system cancelled automatically',
+                    };
+                    if (idx === 0) {
+                      statusQb.where(cancelCond, params);
+                    } else {
+                      statusQb.orWhere(cancelCond, params);
+                    }
+                  } else {
+                    const normalCond = `requests.Request_status = :${paramName}`;
+                    const params = { [paramName]: st };
+                    if (idx === 0) {
+                      statusQb.where(normalCond, params);
+                    } else {
+                      statusQb.orWhere(normalCond, params);
+                    }
+                  }
+                });
+              }),
+            );
+          }
+        }
+
+        const planZoneRes = await this.resolveZoneFilters(searchDto.zoneIds, searchDto.Zone_Id, searchDto.zone);
+        if (planZoneRes) {
+          const { selectedZoneIds, zoneNames } = planZoneRes;
+          if (selectedZoneIds.length > 0 || zoneNames.length > 0) {
+            qb.andWhere(
+              new Brackets((zoneQb) => {
+                let hasCond = false;
+                if (selectedZoneIds.length > 0) {
+                  zoneQb.where('requests.Zone_Id IN (:...selectedZoneIds)', { selectedZoneIds });
+                  hasCond = true;
+                }
+
+                zoneNames.forEach((zName, index) => {
+                  const paramName = `zName_${index}`;
+                  if (hasCond) {
+                    zoneQb.orWhere(`requests.zone LIKE :${paramName}`, { [paramName]: `%${zName}%` });
+                  } else {
+                    zoneQb.where(`requests.zone LIKE :${paramName}`, { [paramName]: `%${zName}%` });
+                    hasCond = true;
+                  }
+                });
+              }),
+            );
           } else {
-            const singleStatus = statusList[0];
-            if (singleStatus === 'Auto-Cancelled') {
-              qb.andWhere('extraMisc.cancelReason = :cancelReason', {
-                cancelReason: 'Permit not opened so system cancelled automatically',
-              });
-            } else if (singleStatus === 'Cancelled') {
-              qb.andWhere('requests.Request_status = :requestStatus', { requestStatus: singleStatus });
-              qb.andWhere(
-                '(extraMisc.cancelReason IS NULL OR extraMisc.cancelReason != :autoCancelMsg)',
-                { autoCancelMsg: 'Permit not opened so system cancelled automatically' },
-              );
-            } else {
-              qb.andWhere('requests.Request_status = :requestStatus', { requestStatus: singleStatus });
-            }
+            qb.andWhere('1 = 0');
           }
         }
 
@@ -3175,9 +3755,6 @@ export class RequestsService {
           { data: dataList },
           { count: totalCount },
         ];
-      },
-      1000 * 60 * 5,
-    );
   }
 
   // 1. Soft delete single request
@@ -3211,7 +3788,55 @@ export class RequestsService {
     return { status: 202, message: 'Request not updated' };
   }
 
-  // 4. Soft delete RAMS file attachment
+  // 4. Upload/Add RAMS file attachments for an existing request
+  async addRamsFiles(
+    requestId: number,
+    files?: any[],
+    userId?: number,
+  ): Promise<any> {
+    if (!requestId || isNaN(requestId)) {
+      return {
+        status: false,
+        message: 'Invalid request ID',
+      };
+    }
+
+    const request = await this.requestRepo.findOne({ where: { id: requestId } });
+    if (!request) {
+      return {
+        status: false,
+        message: `Request with ID ${requestId} not found`,
+      };
+    }
+
+    if (files && files.length > 0) {
+      for (const file of files) {
+        const filePath = file.path.replace(/\\/g, '/');
+        await this.ramsFileRepo.insert({
+          requestId,
+          ramsFile: filePath,
+          status: 1,
+          createdAt: new Date(),
+          userId: userId || 0,
+        });
+      }
+    }
+
+    await this.redisCacheService.deleteByPattern('requests:*');
+
+    const updatedFiles = await this.ramsFileRepo.find({
+      where: { requestId, status: 1 },
+      order: { ramsFileId: 'ASC' },
+    });
+
+    return {
+      status: true,
+      message: 'RAMS Files uploaded successfully',
+      files: updatedFiles,
+    };
+  }
+
+  // Soft delete RAMS file attachment
   async softDeleteRamsFile(ramsFileId: number): Promise<any> {
     await this.ramsFileRepo.update(ramsFileId, { status: 0 });
     await this.redisCacheService.deleteByPattern('requests:*');
@@ -3378,23 +4003,10 @@ export class RequestsService {
     const query = `
       SELECT id FROM requests
       WHERE Request_status = 'Approved'
-      AND (
-        (
-          night_shift = '0'
-          AND Working_Date = ?
-          AND TIMESTAMP(Working_Date, Start_Time) - INTERVAL 5 HOUR <= ?
-        )
-        OR
-        (
-          night_shift = '1'
-          AND Working_Date < ?
-          AND TIMESTAMP(DATE_ADD(Working_Date, INTERVAL 1 DAY), Start_Time) + INTERVAL 4 HOUR >= ?
-        )
-      )
+      AND Working_Date <= ?
+      AND TIMESTAMP(Working_Date, Start_Time) + INTERVAL 4 HOUR <= ?
     `;
     const toCancel = await this.requestRepo.query(query, [
-      curDateStr,
-      curDateTimeStr,
       curDateStr,
       curDateTimeStr,
     ]);
@@ -3419,12 +4031,18 @@ export class RequestsService {
 
         const log = this.logRepo.create({
           requestId: id,
-          userId: 0,
           requestType: 'Cancelled',
           createdTime: nowCph,
           system: 1,
         });
         await this.logRepo.save(log);
+
+        this.notificationsService.triggerNotification(
+          id,
+          'Approved',
+          'Auto-Cancelled',
+          0,
+        ).catch((err) => console.error('Notification error on auto-cancel:', err));
       }
       await this.redisCacheService.deleteByPattern('requests:*');
     }
@@ -3450,7 +4068,8 @@ export class RequestsService {
         userTypes.includes('SuperAdmin') ||
         userTypes.includes('Department') ||
         userTypes.includes('Department1') ||
-        userTypes.includes('HSE')
+        userTypes.includes('HSE') ||
+        userTypes.includes('Observer')
       ) {
         // No filter for admin / department
       } else {
@@ -3565,7 +4184,8 @@ export class RequestsService {
         userTypes.includes('SuperAdmin') ||
         userTypes.includes('Department') ||
         userTypes.includes('Department1') ||
-        userTypes.includes('HSE')
+        userTypes.includes('HSE') ||
+        userTypes.includes('Observer')
       ) {
         // No filter
       } else {
@@ -3622,7 +4242,8 @@ export class RequestsService {
         userTypes.includes('SuperAdmin') ||
         userTypes.includes('Department') ||
         userTypes.includes('Department1') ||
-        userTypes.includes('HSE')
+        userTypes.includes('HSE') ||
+        userTypes.includes('Observer')
       ) {
         // No filter
       } else {
@@ -3719,7 +4340,8 @@ export class RequestsService {
         userTypes.includes('SuperAdmin') ||
         userTypes.includes('Department') ||
         userTypes.includes('Department1') ||
-        userTypes.includes('HSE')
+        userTypes.includes('HSE') ||
+        userTypes.includes('Observer')
       ) {
         // Admin/HSE/Department sees all
       } else {
@@ -4405,7 +5027,7 @@ export class RequestsService {
         checkCheckbox('lanyard_attachments', subTables?.hgt?.lanyardAttachments);
         checkCheckbox('rescue_plan', subTables?.hgt?.rescuePlan);
         checkCheckbox('avoid_hazards', subTables?.hgt?.avoidHazards);
-        checkCheckbox('height_training', undefined);
+        checkCheckbox('height_training', subTables?.hgt?.heightTraining);
         checkCheckbox('supervision', subTables?.hgt?.supervision);
         checkCheckbox('shock_absorbing', subTables?.hgt?.shockAbsorbing);
         checkCheckbox('height_equipments', subTables?.hgt?.heightEquipments);
@@ -4729,7 +5351,7 @@ export class RequestsService {
         foremanPhoneNumber: dto.Foreman_Phone_Number ?? originalRequest.foremanPhoneNumber,
         activity: dto.Activity ?? originalRequest.activity,
         typeOfActivityId: dto.Type_Of_Activity_Id ?? originalRequest.typeOfActivityId,
-        requestDate: dto.Request_Date ?? originalRequest.requestDate,
+        requestDate: new Date().toISOString().split('T')[0],
         startTime: dto.Start_Time ?? originalRequest.startTime,
         endTime: dto.End_Time ?? originalRequest.endTime,
         assignStartTime: dto.Assign_Start_Time ?? originalRequest.assignStartTime,
@@ -4749,14 +5371,24 @@ export class RequestsService {
         siteId: dto.Site_Id ?? originalRequest.siteId ?? 5,
         permitType: originalRequest.permitType,
         permitUnder: originalRequest.permitUnder || 'Construction',
-        newEndTime: originalRequest.newEndTime,
-        nightShift: originalRequest.nightShift,
+        newEndTime: dto.New_End_Time ?? originalRequest.newEndTime,
+        nightShift: dto.night_shift !== undefined ? String(dto.night_shift) : originalRequest.nightShift,
+        numberOfWorkers: dto.Number_Of_Workers ?? originalRequest.numberOfWorkers,
         safetyPrecautions: originalRequest.safetyPrecautions,
       });
 
       const saved = await this.requestRepo.save(newRequest);
       const requestId = saved.id;
       createdIds.push(requestId);
+
+      if (saved.requestStatus) {
+        this.notificationsService.triggerNotification(
+          saved.id,
+          null,
+          saved.requestStatus,
+          saved.userId ?? 0,
+        ).catch((err) => console.error('Notification error:', err));
+      }
 
       // Copy sub-tables from original
       if (origChem) {
@@ -4803,14 +5435,32 @@ export class RequestsService {
 
       if (origExt) {
         const { requestId: _rid, id: _id, ...extData } = origExt as any;
-        await this.extraMiscRepo.save(this.extraMiscRepo.create({ ...extData, requestId }));
+        await this.extraMiscRepo.save(this.extraMiscRepo.create({
+          ...extData,
+          conMInitials: null,
+          conMInitials1: null,
+          coMMInitials: null,
+          rejectReason: null,
+          cancelReason: null,
+          closeNote: null,
+          requestId
+        }));
       } else {
         await this.extraMiscRepo.save(this.extraMiscRepo.create({ requestId }));
       }
 
       if (origFire) {
         const { requestId: _rid, id: _id, ...fireData } = origFire as any;
-        await this.fireHotworkRepo.save(this.fireHotworkRepo.create({ ...fireData, requestId }));
+        await this.fireHotworkRepo.save(this.fireHotworkRepo.create({
+          ...fireData,
+          hHeatSource: null,
+          hWorkplaceCheck: null,
+          hFireDetectors: null,
+          hStartTime: null,
+          hEndTime: null,
+          fireImage: null,
+          requestId
+        }));
       } else {
         await this.fireHotworkRepo.save(this.fireHotworkRepo.create({ requestId }));
       }
@@ -4981,8 +5631,13 @@ export class RequestsService {
       if (!sub) return;
       for (const column of repo.metadata.columns) {
         if (column.propertyName !== 'requestId') {
-          const val = sub[column.propertyName];
-          flatObj[column.databaseName] = val !== undefined && val !== null ? val : '';
+          let val = sub[column.propertyName];
+          if (val === undefined) {
+            val = sub[column.databaseName];
+          }
+          const finalVal = val !== undefined && val !== null ? val : '';
+          flatObj[column.databaseName] = finalVal;
+          flatObj[column.propertyName] = finalVal;
         }
       }
     };
@@ -5003,6 +5658,39 @@ export class RequestsService {
 
     if (flatObj.course_of_actions !== undefined) {
       flatObj.course_of_action = flatObj.course_of_actions;
+    }
+    if (flatObj.course_of_action !== undefined) {
+      flatObj.course_of_actions = flatObj.course_of_action;
+    }
+    if (flatObj.hazardous_substances !== undefined) {
+      flatObj.hazardaus_substances = flatObj.hazardous_substances;
+    }
+    if (flatObj.hazardaus_substances !== undefined) {
+      flatObj.hazardous_substances = flatObj.hazardaus_substances;
+    }
+    if (flatObj.vendor_supplies !== undefined) {
+      flatObj.vendor_supplier = flatObj.vendor_supplies;
+    }
+    if (flatObj.vendor_supplier !== undefined) {
+      flatObj.vendor_supplies = flatObj.vendor_supplier;
+    }
+    if (flatObj.isolating_responsible !== undefined) {
+      flatObj.isolating_resposible = flatObj.isolating_responsible;
+    }
+    if (flatObj.isolating_resposible !== undefined) {
+      flatObj.isolating_responsible = flatObj.isolating_resposible;
+    }
+    if (flatObj.pnematic_hydrostatic !== undefined) {
+      flatObj.pneumatic_hydrostatic = flatObj.pnematic_hydrostatic;
+    }
+    if (flatObj.pneumatic_hydrostatic !== undefined) {
+      flatObj.pnematic_hydrostatic = flatObj.pneumatic_hydrostatic;
+    }
+    if (flatObj.specific_risks_based_on_task !== undefined) {
+      flatObj.spesific_risks_based_on_task = flatObj.specific_risks_based_on_task;
+    }
+    if (flatObj.spesific_risks_based_on_task !== undefined) {
+      flatObj.specific_risks_based_on_task = flatObj.spesific_risks_based_on_task;
     }
 
     // Fetch Opened (check-in) log
@@ -5148,6 +5836,923 @@ export class RequestsService {
       request,
       logs: logsWithData,
       images,
+    };
+  }
+
+  // ── Executive Dashboard APIs ──
+  // ── Executive Dashboard APIs ──
+  async getDashboardOverview(filterPayload?: any) {
+    let rawBuilding = typeof filterPayload === 'string' ? filterPayload : (filterPayload?.building || filterPayload?.buildingId);
+    let buildingIdVal = typeof filterPayload === 'object' ? (filterPayload?.buildingId || filterPayload?.building) : filterPayload;
+    let bNum = Number(buildingIdVal);
+
+    // status = 1 means active; status = 0 means soft-deleted — excluded by WHERE below
+    const query = this.requestRepo.createQueryBuilder('req')
+      .leftJoin('request_extra_misc', 'rem', 'rem.request_id = req.id')
+      .addSelect('rem.cancel_reason', 'rem_cancelReason')
+      .where('req.status = :st', { st: 1 });
+
+    const fromDate = filterPayload?.fromDate;
+    const toDate = filterPayload?.toDate;
+
+    if (fromDate && fromDate.trim() !== '') {
+      query.andWhere('req.Working_Date >= :fromDate', { fromDate });
+    }
+    if (toDate && toDate.trim() !== '') {
+      query.andWhere('req.Working_Date <= :toDate', { toDate });
+    }
+
+    if (rawBuilding && String(rawBuilding).trim() !== '' && String(rawBuilding).toLowerCase() !== 'all') {
+      if (!isNaN(bNum) && bNum > 0) {
+        query.andWhere(
+          '(req.buildingId = :bId OR req.roomType LIKE :bNameStr)',
+          { bId: bNum, bNameStr: `%${rawBuilding}%` },
+        );
+      } else {
+        query.andWhere(
+          '(req.buildingId IN (SELECT b.build_id FROM buildings b WHERE b.building_name LIKE :bName) OR req.roomType LIKE :bNameStr)',
+          { bName: `%${rawBuilding}%`, bNameStr: `%${rawBuilding}%` },
+        );
+      }
+    }
+
+    const rawResults = await query.getRawAndEntities();
+    const allRequests = rawResults.entities.map((e, i) => ({
+      ...e,
+      _cancelReason: rawResults.raw[i]?.rem_cancelReason ?? null,
+    }));
+
+    const allSubcontractors = await this.subcontractorRepo.find();
+
+    const subMap = new Map<number, Subcontractor>();
+    allSubcontractors.forEach((s) => subMap.set(s.id, s));
+
+    const total = allRequests.length;
+    let opened = 0;
+    let approved = 0;
+    let hold = 0;
+    let rejected = 0;
+    let draft = 0;
+    let autoCancel = 0;
+    let cancelled = 0;
+    let closed = 0;
+    let preApproved = 0;
+    let unknown = 0;
+
+    // The exact cancel_reason string the system writes when auto-cancelling
+    const AUTO_CANCEL_MSG = 'Permit not opened so system cancelled automatically';
+
+    // Helper — normalise the status string from any DB column variation
+    const normaliseStatus = (r: any): string =>
+      (r.Request_status || r.requestStatus || '').toString().toLowerCase().trim();
+
+    const classifyStatus = (st: string, cancelReason?: string | null) => {
+      if (st === 'opened' || st === 'open' || st === 'pending') opened++;
+      else if (st === 'pre-approved' || st === 'preapproved' || st === 'pre approved') preApproved++;
+      else if (st === 'approved') approved++;
+      else if (st === 'hold' || st === 'onhold' || st === 'on hold' || st === 'on-hold') hold++;
+      else if (st === 'rejected' || st === 'reject') rejected++;
+      else if (st === 'draft') draft++;
+      else if (st === 'closed' || st === 'close') closed++;
+      else if (st === 'cancelled' || st === 'cancel') {
+        // Split by cancel_reason: system auto-cancel vs manual cancel
+        if (cancelReason && cancelReason.trim() === AUTO_CANCEL_MSG) autoCancel++;
+        else cancelled++;
+      }
+      else if (
+        st === 'auto-cancelled' || st === 'autocancelled' || st === 'autocanceled' || st === 'auto cancel'
+      ) autoCancel++;
+      else unknown++; // do NOT fall back into opened
+    };
+
+    const companyStats = new Map<string, { name: string; code: string; permits: number; rooms: Set<string>; color: string }>();
+    const palette = ['#e11d48', '#4b5563', '#15803d', '#b91c1c', '#be123c', '#0369a1', '#6b7280', '#d97706', '#991b1b', '#1e3a8a', '#0284c7', '#10b981', '#78350f', '#ea580c'];
+    let colorIdx = 0;
+
+    const roomCompanyMap = new Map<string, Set<string>>();
+
+    allRequests.forEach((req) => {
+      const st = normaliseStatus(req);
+      classifyStatus(st, (req as any)._cancelReason);
+
+      let compName = (req as any).Company_Name || req.companyName;
+      const subId = (req as any).Sub_Contractor_Id || req.subContractorId;
+      if (subId && subMap.has(Number(subId))) {
+        compName = subMap.get(Number(subId))?.subContractorName || compName;
+      }
+      if (!compName) compName = 'Unknown';
+
+      let code = compName.split(' ').map((w: string) => w[0]).join('').substring(0, 3).toUpperCase();
+      if (!code) code = 'UNK';
+
+      if (!companyStats.has(compName)) {
+        companyStats.set(compName, {
+          name: compName,
+          code,
+          permits: 0,
+          rooms: new Set<string>(),
+          color: palette[colorIdx % palette.length],
+        });
+        colorIdx++;
+      }
+
+      const compData = companyStats.get(compName)!;
+      compData.permits++;
+
+      const roomKey = (req as any).Room_Nos || req.roomNos || req.zone || 'General Area';
+      if (roomKey) {
+        compData.rooms.add(roomKey);
+        if (!roomCompanyMap.has(roomKey)) {
+          roomCompanyMap.set(roomKey, new Set<string>());
+        }
+        roomCompanyMap.get(roomKey)!.add(compName);
+      }
+    });
+
+    let clashes = 0;
+    roomCompanyMap.forEach((companies) => {
+      if (companies.size > 1) clashes++;
+    });
+
+    const overviewCompanies = Array.from(companyStats.values()).map((c) => {
+      let companyClashes = 0;
+      c.rooms.forEach((rKey) => {
+        if ((roomCompanyMap.get(rKey)?.size || 0) > 1) {
+          companyClashes++;
+        }
+      });
+      return {
+        name: c.name,
+        code: c.code,
+        permits: c.permits,
+        rooms: c.rooms.size,
+        clashes: companyClashes,
+        color: c.color,
+      };
+    });
+
+    const allFloors = await this.floorRepo.find();
+    const allBuildings = await this.buildingRepo.find();
+    const allRooms = await this.roomRepo.find();
+
+    let targetBuildingId: number | null = !isNaN(bNum) && bNum > 0 ? bNum : null;
+    if (!targetBuildingId && rawBuilding && String(rawBuilding).trim() !== '' && String(rawBuilding).toLowerCase() !== 'all') {
+      const bObj = allBuildings.find(
+        (b) => b.building_name.toLowerCase().trim().includes(String(rawBuilding).toLowerCase().trim())
+      );
+      if (bObj) {
+        targetBuildingId = bObj.build_id;
+      }
+    }
+
+    let assignedFloors: Floor[] = [];
+    if (targetBuildingId) {
+      assignedFloors = allFloors.filter((f) => Number(f.build_id) === Number(targetBuildingId));
+    } else {
+      assignedFloors = allFloors;
+    }
+
+    const floorStatsMap = new Map<string, {
+      id: number | null;
+      name: string;
+      permits: number;
+      roomsSet: Set<string>;
+    }>();
+
+    assignedFloors.forEach((fl) => {
+      const normName = fl.floor_name.trim();
+      floorStatsMap.set(normName.toLowerCase(), {
+        id: fl.fl_id,
+        name: normName,
+        permits: 0,
+        roomsSet: new Set<string>(),
+      });
+    });
+
+    const resolveReqFloorName = (req: any): string | null => {
+      const fId = Number((req as any).Floor_Id || req.floorId);
+      if (!isNaN(fId) && fId > 0) {
+        const matched = allFloors.find((f) => Number(f.fl_id) === fId);
+        if (matched) return matched.floor_name.trim();
+      }
+      const rawRoomNos = (req as any).Room_Nos || req.roomNos || '';
+      if (rawRoomNos) {
+        const roomParts = String(rawRoomNos).split(',').map((s) => Number(s.trim())).filter((n) => !isNaN(n) && n > 0);
+        for (const rId of roomParts) {
+          const roomObj = allRooms.find((r) => Number(r.room_id) === rId);
+          if (roomObj && roomObj.fl_id) {
+            const matched = allFloors.find((f) => Number(f.fl_id) === Number(roomObj.fl_id));
+            if (matched) return matched.floor_name.trim();
+          }
+        }
+      }
+      return null;
+    };
+
+    allRequests.forEach((req) => {
+      const fName = resolveReqFloorName(req);
+      if (fName) {
+        const key = fName.toLowerCase();
+        if (!floorStatsMap.has(key)) {
+          floorStatsMap.set(key, {
+            id: null,
+            name: fName,
+            permits: 0,
+            roomsSet: new Set<string>(),
+          });
+        }
+        const fStats = floorStatsMap.get(key)!;
+        fStats.permits += 1;
+
+        const roomKey = (req as any).Room_Nos || req.roomNos || req.zone || 'General Area';
+        if (roomKey) fStats.roomsSet.add(roomKey);
+      }
+    });
+
+    const floors = Array.from(floorStatsMap.values()).map((f) => {
+      let status = 'gray';
+      if (f.permits > 5) status = 'purple';
+      else if (f.permits > 0) status = 'blue';
+
+      let dbRoomCount = 0;
+      if (f.id !== null) {
+        dbRoomCount = allRooms.filter((r) => Number(r.fl_id) === Number(f.id)).length;
+      }
+
+      return {
+        id: f.id,
+        name: f.name,
+        permits: f.permits,
+        rooms: dbRoomCount > 0 ? dbRoomCount : f.roomsSet.size,
+        status,
+      };
+    });
+
+    return {
+      metrics: {
+        total,
+        opened,
+        preApproved,
+        approved,
+        hold,
+        rejected,
+        draft,
+        cancelled,
+        closed,
+        autoCancel,
+        unknown,
+        activeRooms: roomCompanyMap.size,
+        activeCompanies: companyStats.size,
+        clashes,
+      },
+      overviewCompanies,
+      floors,
+    };
+  }
+
+  async getDashboardBuilding(filterPayload?: any, floorNameParam?: string) {
+    let rawBuilding = typeof filterPayload === 'string' ? filterPayload : (filterPayload?.building || filterPayload?.buildingId);
+    let floorName = typeof filterPayload === 'string' ? floorNameParam : filterPayload?.floor || filterPayload?.floorId;
+    let roomName = typeof filterPayload === 'object' ? (filterPayload?.room || filterPayload?.rooms) : undefined;
+    let buildingIdVal = typeof filterPayload === 'object' ? (filterPayload?.buildingId || filterPayload?.building) : filterPayload;
+    let bNum = Number(buildingIdVal);
+
+    // status = 1 means active; status = 0 means soft-deleted — excluded by WHERE below
+    const query = this.requestRepo.createQueryBuilder('req')
+      .leftJoin('request_extra_misc', 'rem', 'rem.request_id = req.id')
+      .addSelect('rem.cancel_reason', 'rem_cancelReason')
+      .where('req.status = :st', { st: 1 });
+
+    const fromDate = filterPayload?.fromDate;
+    const toDate = filterPayload?.toDate;
+
+    if (fromDate && fromDate.trim() !== '') {
+      query.andWhere('req.Working_Date >= :fromDate', { fromDate });
+    }
+    if (toDate && toDate.trim() !== '') {
+      query.andWhere('req.Working_Date <= :toDate', { toDate });
+    }
+
+    if (rawBuilding && String(rawBuilding).trim() !== '' && String(rawBuilding).toLowerCase() !== 'all') {
+      if (!isNaN(bNum) && bNum > 0) {
+        query.andWhere(
+          '(req.buildingId = :bId OR req.roomType LIKE :bNameStr)',
+          { bId: bNum, bNameStr: `%${rawBuilding}%` },
+        );
+      } else {
+        query.andWhere(
+          '(req.buildingId IN (SELECT b.build_id FROM buildings b WHERE b.building_name LIKE :bName) OR req.roomType LIKE :bNameStr)',
+          { bName: `%${rawBuilding}%`, bNameStr: `%${rawBuilding}%` },
+        );
+      }
+    }
+
+    if (floorName && String(floorName).trim() !== '' && String(floorName).toLowerCase() !== 'overview') {
+      const fNum = Number(floorName);
+      if (!isNaN(fNum) && fNum > 0) {
+        query.andWhere(
+          '(req.floorId = :fId OR req.roomType LIKE :fNameStr)',
+          { fId: fNum, fNameStr: `%${floorName}%` },
+        );
+      } else {
+        query.andWhere(
+          '(req.floorId IN (SELECT f.fl_id FROM floors f WHERE f.floor_name LIKE :fName) OR req.roomType LIKE :fNameStr)',
+          { fName: `%${floorName}%`, fNameStr: `%${floorName}%` },
+        );
+      }
+    }
+
+    if (roomName && roomName.trim() !== '') {
+      query.andWhere(
+        '(req.roomNos LIKE :rName OR req.zone LIKE :rName)',
+        { rName: `%${roomName}%` },
+      );
+    }
+
+    const rawBuildingResults = await query.getRawAndEntities();
+    const allRequests = rawBuildingResults.entities.map((e, i) => ({
+      ...e,
+      _cancelReason: rawBuildingResults.raw[i]?.rem_cancelReason ?? null,
+    }));
+
+    const allSubcontractors = await this.subcontractorRepo.find();
+    const allRooms = await this.roomRepo.find();
+    const allZones = await this.zoneRepo.find();
+    const allFloors = await this.floorRepo.find();
+
+    const roomLookup = new Map<number, { roomName: string; zoneName: string }>();
+    const zoneLookup = new Map<number, string>();
+    allZones.forEach((z) => zoneLookup.set(z.id, z.zone));
+
+    allRooms.forEach((r) => {
+      const zName = r.zone_id && zoneLookup.has(r.zone_id) ? zoneLookup.get(r.zone_id)! : '';
+      roomLookup.set(r.room_id, {
+        roomName: r.room_name,
+        zoneName: zName,
+      });
+    });
+
+    const getIndividualRoomDisplayNames = (req: any): string[] => {
+      const rawRoomNos = (req as any).Room_Nos || req.roomNos || '';
+      const rawZoneName = (req as any).zone_name || (req as any).zone?.zone || (typeof req.zone === 'string' ? req.zone : '') || '';
+
+      if (rawRoomNos) {
+        const parts = String(rawRoomNos).split(',').map((s) => s.trim()).filter(Boolean);
+        const resolvedNames: string[] = [];
+
+        parts.forEach((p) => {
+          const rId = Number(p);
+          if (!isNaN(rId) && roomLookup.has(rId)) {
+            const rInfo = roomLookup.get(rId)!;
+            const prefix = rInfo.zoneName ? `${rInfo.zoneName} - ` : (rawZoneName ? `${rawZoneName} - ` : '');
+            resolvedNames.push(`${prefix}${rInfo.roomName}`);
+          } else {
+            const prefix = rawZoneName ? `${rawZoneName} - ` : '';
+            resolvedNames.push(`${prefix}${p}`);
+          }
+        });
+
+        if (resolvedNames.length > 0) {
+          return resolvedNames;
+        }
+      }
+
+      if (rawZoneName && rawZoneName !== 'ZONE 1') {
+        return [rawZoneName];
+      }
+
+      return [(req as any).room_names || 'General Area'];
+    };
+
+    const subMap = new Map<number, Subcontractor>();
+    const normSubMap = new Map<string, Subcontractor>();
+    allSubcontractors.forEach((s) => {
+      subMap.set(s.id, s);
+      if (s.subContractorName) {
+        normSubMap.set(s.subContractorName.trim().toLowerCase(), s);
+      }
+    });
+
+    const getCanonicalCompany = (req: any): { name: string; code: string; logo?: string } => {
+      const subId = (req as any).Sub_Contractor_Id || req.subContractorId;
+      let subObj: Subcontractor | undefined;
+
+      if (subId && subMap.has(Number(subId))) {
+        subObj = subMap.get(Number(subId));
+      }
+
+      if (!subObj) {
+        const rawName = ((req as any).Company_Name || req.companyName || '').toString().trim();
+        if (rawName && normSubMap.has(rawName.toLowerCase())) {
+          subObj = normSubMap.get(rawName.toLowerCase());
+        }
+      }
+
+      if (subObj) {
+        const cleanName = (subObj.subContractorName || '').trim();
+        let code = cleanName.split(' ').map((w: string) => w[0]).join('').substring(0, 3).toUpperCase();
+        if (!code) code = 'UNK';
+        return {
+          name: cleanName,
+          code,
+          logo: subObj.logo || undefined,
+        };
+      }
+
+      const rawComp = ((req as any).Company_Name || req.companyName || 'Unknown').toString().trim();
+      const cleanName = rawComp || 'Unknown';
+      let code = cleanName.split(' ').map((w: string) => w[0]).join('').substring(0, 3).toUpperCase();
+      if (!code) code = 'UNK';
+      return {
+        name: cleanName,
+        code,
+        logo: undefined,
+      };
+    };
+
+    const getStatus = (r: any) => (r.Request_status || r.requestStatus || '').toString().toLowerCase().trim();
+    const getPermitType = (r: any) => (r.permit_type || r.permitType || '').toString().toLowerCase().trim();
+    const getCombinedActivity = (r: any) => {
+      const act = (r.Activity || r.activity || r.activityName || '').toString().toLowerCase();
+      const saf = (r.Safety_Precautions || r.safetyPrecautions || '').toString().toLowerCase();
+      const desc = (r.description_of_activity || r.descriptionOfActivity || '').toString().toLowerCase();
+      return `${act} ${saf} ${desc}`;
+    };
+
+    const isHW = (r: any, comb: string) => Number(r.Hot_work) === 1 || Number(r.hot_work) === 1 || comb.includes('hot work') || comb.includes('fire');
+    const isElec = (r: any, comb: string) => Number(r.working_on_electrical_system) === 1 || comb.includes('electrical') || comb.includes('voltage');
+    const isHaz = (r: any, comb: string) => Number(r.working_hazardious_substen) === 1 || Number(r.hazardous_substances) === 1 || comb.includes('chemical') || comb.includes('substance') || comb.includes('hazard');
+    const isHeight = (r: any, comb: string) => Number(r.working_at_height) === 1 || comb.includes('height') || comb.includes('ladder') || comb.includes('scaffold');
+    const isConf = (r: any, comb: string) => Number(r.working_confined_spaces) === 1 || comb.includes('confined');
+    const isExc = (r: any, comb: string) => Number(r.excavation_works) === 1 || comb.includes('excavation') || comb.includes('digging');
+    const isCrane = (r: any, comb: string) => Number(r.using_cranes_or_lifting) === 1 || comb.includes('crane') || comb.includes('lifting');
+    const isPress = (r: any, comb: string) => Number(r.pressure_testing_of_equipment) === 1 || comb.includes('pressure') || comb.includes('testing');
+
+    const filteredRequests = allRequests.filter((req) => {
+      if (typeof filterPayload !== 'object' || !filterPayload) return true;
+
+      if (filterPayload.permitTypes) {
+        const pType = getPermitType(req);
+        const isComm = pType.includes('commissioning');
+        const isConst = !isComm;
+        if (isComm && filterPayload.permitTypes.commissioning === false) return false;
+        if (isConst && filterPayload.permitTypes.construction === false) return false;
+      }
+
+      if (filterPayload.permitStatuses) {
+        const st = getStatus(req);
+        const isOpen = st === 'opened' || st === 'open';
+        const isAppr = st === 'approved' || st === 'pre-approved';
+        const isRej = st === 'rejected' || st === 'reject';
+        const isDraft = st === 'draft';
+        const isAuto = st.includes('cancel');
+
+        if (isOpen && filterPayload.permitStatuses.opened === false) return false;
+        if (isAppr && filterPayload.permitStatuses.approved === false) return false;
+        if (isRej && filterPayload.permitStatuses.rejected === false) return false;
+        if (isDraft && filterPayload.permitStatuses.draft === false) return false;
+        if (isAuto && filterPayload.permitStatuses.autoCancel === false) return false;
+      }
+
+      if (filterPayload.selectedCompanies && Array.isArray(filterPayload.selectedCompanies) && filterPayload.selectedCompanies.length > 0) {
+        const canonical = getCanonicalCompany(req);
+        const matches = filterPayload.selectedCompanies.some((sc: string) => {
+          const scClean = String(sc).trim().toLowerCase();
+          const nameClean = canonical.name.toLowerCase();
+          const codeClean = canonical.code.toLowerCase();
+          return nameClean === scClean || codeClean === scClean || nameClean.includes(scClean) || scClean.includes(nameClean);
+        });
+        if (!matches) return false;
+      }
+
+      if (filterPayload.activityRiskTypes) {
+        const combined = getCombinedActivity(req);
+        const isHotWork = isHW(req, combined);
+        const isElectrical = isElec(req, combined);
+        const isHazardous = isHaz(req, combined);
+        const isWorkHeight = isHeight(req, combined);
+        const isConfined = isConf(req, combined);
+        const isExcavation = isExc(req, combined);
+        const isCranes = isCrane(req, combined);
+        const isPressure = isPress(req, combined);
+
+        const isAnyHra = isHotWork || isElectrical || isHazardous || isWorkHeight || isConfined || isExcavation || isCranes || isPressure;
+
+        if (isAnyHra) {
+          if (filterPayload.activityRiskTypes.hra === false) return false;
+          if (isHotWork && filterPayload.activityRiskTypes.hotWork === false) return false;
+          if (isElectrical && filterPayload.activityRiskTypes.electrical === false) return false;
+          if (isHazardous && filterPayload.activityRiskTypes.hazardousSubstances === false) return false;
+          if (isWorkHeight && filterPayload.activityRiskTypes.workingAtHeight === false) return false;
+          if (isConfined && filterPayload.activityRiskTypes.confinedSpaces === false) return false;
+          if (isExcavation && filterPayload.activityRiskTypes.excavation === false) return false;
+          if (isCranes && filterPayload.activityRiskTypes.cranesLifting === false) return false;
+          if (isPressure && filterPayload.activityRiskTypes.pressureTesting === false) return false;
+        } else {
+          if (filterPayload.activityRiskTypes.nonHra === false) return false;
+        }
+      }
+
+      return true;
+    });
+
+    const companyMap = new Map<string, { name: string; code: string; count: number; color: string; logo?: string }>();
+    const palette = ['#e11d48', '#4b5563', '#15803d', '#b91c1c', '#be123c', '#0369a1', '#6b7280', '#d97706', '#991b1b', '#1e3a8a', '#0284c7', '#10b981', '#78350f', '#ea580c'];
+    let colorIdx = 0;
+
+    allSubcontractors.forEach((s) => {
+      const cName = (s.subContractorName || '').trim();
+      if (cName && !companyMap.has(cName)) {
+        let code = cName.split(' ').map((w: string) => w[0]).join('').substring(0, 3).toUpperCase();
+        if (!code) code = 'UNK';
+        companyMap.set(cName, {
+          name: cName,
+          code,
+          count: 0,
+          color: palette[colorIdx % palette.length],
+          logo: s.logo || undefined,
+        });
+        colorIdx++;
+      }
+    });
+
+    allRequests.forEach((req) => {
+      const canonical = getCanonicalCompany(req);
+      if (canonical.name) {
+        if (!companyMap.has(canonical.name)) {
+          companyMap.set(canonical.name, {
+            name: canonical.name,
+            code: canonical.code,
+            count: 0,
+            color: palette[colorIdx % palette.length],
+            logo: canonical.logo,
+          });
+          colorIdx++;
+        }
+        companyMap.get(canonical.name)!.count++;
+      }
+    });
+
+    let commissioning = 0;
+    let construction = 0;
+
+    let opened = 0;
+    let preApproved = 0;
+    let approved = 0;
+    let hold = 0;
+    let rejected = 0;
+    let draft = 0;
+    let autoCancel = 0;
+    let cancelled = 0;
+    let closed = 0;
+    let unknown = 0;
+
+    const AUTO_CANCEL_MSG = 'Permit not opened so system cancelled automatically';
+
+    const classifyBuildingStatus = (st: string, cancelReason?: string | null) => {
+      if (st === 'opened' || st === 'open' || st === 'pending') opened++;
+      else if (st === 'pre-approved' || st === 'preapproved' || st === 'pre approved') preApproved++;
+      else if (st === 'approved') approved++;
+      else if (st === 'hold' || st === 'onhold' || st === 'on hold' || st === 'on-hold') hold++;
+      else if (st === 'rejected' || st === 'reject') rejected++;
+      else if (st === 'draft') draft++;
+      else if (st === 'closed' || st === 'close') closed++;
+      else if (st === 'cancelled' || st === 'cancel') {
+        if (cancelReason && cancelReason.trim() === AUTO_CANCEL_MSG) autoCancel++;
+        else cancelled++;
+      }
+      else if (
+        st === 'auto-cancelled' || st === 'autocancelled' || st === 'autocanceled' || st === 'auto cancel'
+      ) autoCancel++;
+      else unknown++;
+    };
+
+    let nonHra = 0;
+    let hra = 0;
+    let hotWork = 0;
+    let electrical = 0;
+    let hazardousSubstances = 0;
+    let workingAtHeight = 0;
+    let confinedSpaces = 0;
+    let excavation = 0;
+    let cranesLifting = 0;
+    let pressureTesting = 0;
+
+    const zoneMap = new Map<string, {
+      zone: string;
+      companies: Set<string>;
+      clash: boolean;
+      hra: boolean;
+      onHold: boolean;
+      preOk: number;
+      permits: number;
+      hraActivities: Set<string>;
+    }>();
+
+    allRequests.forEach((req) => {
+      const pType = getPermitType(req);
+      if (pType.includes('commissioning')) commissioning++;
+      else construction++;
+
+      const st = getStatus(req);
+      classifyBuildingStatus(st, (req as any)._cancelReason);
+
+      const combined = getCombinedActivity(req);
+      const isHotWork = isHW(req, combined);
+      const isElectrical = isElec(req, combined);
+      const isHazardous = isHaz(req, combined);
+      const isWorkHeight = isHeight(req, combined);
+      const isConfined = isConf(req, combined);
+      const isExcavation = isExc(req, combined);
+      const isCranes = isCrane(req, combined);
+      const isPressure = isPress(req, combined);
+
+      if (isHotWork) hotWork++;
+      if (isElectrical) electrical++;
+      if (isHazardous) hazardousSubstances++;
+      if (isWorkHeight) workingAtHeight++;
+      if (isConfined) confinedSpaces++;
+      if (isExcavation) excavation++;
+      if (isCranes) cranesLifting++;
+      if (isPressure) pressureTesting++;
+
+      const isAnyHra = isHotWork || isElectrical || isHazardous || isWorkHeight || isConfined || isExcavation || isCranes || isPressure;
+      if (isAnyHra) hra++;
+      else nonHra++;
+    });
+
+    let targetFloorId: number | null = !isNaN(Number(floorName)) && Number(floorName) > 0 ? Number(floorName) : null;
+    if (!targetFloorId && floorName && String(floorName).trim() !== '' && String(floorName).toLowerCase() !== 'overview') {
+      const fObj = allFloors.find((f) => f.floor_name.toLowerCase().trim() === String(floorName).toLowerCase().trim());
+      if (fObj) targetFloorId = fObj.fl_id;
+    }
+
+    let relevantDbRooms = targetFloorId
+      ? allRooms.filter((r) => Number(r.fl_id) === Number(targetFloorId))
+      : allRooms;
+
+    let targetBuildingId: number | null = !isNaN(bNum) && bNum > 0 ? bNum : null;
+    if (targetBuildingId && (!relevantDbRooms || relevantDbRooms.length === 0)) {
+      relevantDbRooms = allRooms.filter((r) => Number(r.building_id) === Number(targetBuildingId));
+    }
+
+    const dbZoneMap = new Map<string, {
+      zone: string;
+      companies: Set<string>;
+      clash: boolean;
+      hra: boolean;
+      onHold: boolean;
+      preOk: number;
+      permits: number;
+      hraActivities: Set<string>;
+    }>();
+
+    const dbRoomKeyLookup = new Map<string, string>();
+
+    relevantDbRooms.forEach((r) => {
+      const rName = (r.room_name || '').trim();
+      if (rName) {
+        const zName = r.zone_id && zoneLookup.has(r.zone_id) ? `${zoneLookup.get(r.zone_id)!} - ${rName}` : rName;
+        const mainKey = zName;
+
+        if (!dbZoneMap.has(mainKey)) {
+          dbZoneMap.set(mainKey, {
+            zone: mainKey,
+            companies: new Set<string>(),
+            clash: false,
+            hra: false,
+            onHold: false,
+            preOk: 0,
+            permits: 0,
+            hraActivities: new Set<string>(),
+          });
+        }
+
+        dbRoomKeyLookup.set(String(r.room_id), mainKey);
+        dbRoomKeyLookup.set(rName.toLowerCase(), mainKey);
+        dbRoomKeyLookup.set(zName.toLowerCase(), mainKey);
+      }
+    });
+
+    filteredRequests.forEach((req) => {
+      const canonical = getCanonicalCompany(req);
+      const st = getStatus(req);
+      const combined = getCombinedActivity(req);
+      const isHotWork = isHW(req, combined);
+      const isElectrical = isElec(req, combined);
+      const isHazardous = isHaz(req, combined);
+      const isWorkHeight = isHeight(req, combined);
+      const isConfined = isConf(req, combined);
+      const isExcavation = isExc(req, combined);
+      const isCranes = isCrane(req, combined);
+      const isPressure = isPress(req, combined);
+      const isAnyHra = isHotWork || isElectrical || isHazardous || isWorkHeight || isConfined || isExcavation || isCranes || isPressure;
+
+      const rawRoomNos = (req as any).Room_Nos || req.roomNos || '';
+      const matchedKeys = new Set<string>();
+
+      if (rawRoomNos) {
+        const parts = String(rawRoomNos).split(',').map((s) => s.trim()).filter(Boolean);
+        parts.forEach((p) => {
+          if (dbRoomKeyLookup.has(p.toLowerCase())) {
+            matchedKeys.add(dbRoomKeyLookup.get(p.toLowerCase())!);
+          }
+        });
+      }
+
+      if (matchedKeys.size === 0) {
+        const rType = ((req as any).room_names || req.roomType || req.zone || '').toString().trim().toLowerCase();
+        if (rType && dbRoomKeyLookup.has(rType)) {
+          matchedKeys.add(dbRoomKeyLookup.get(rType)!);
+        }
+      }
+
+      matchedKeys.forEach((key) => {
+        const zData = dbZoneMap.get(key);
+        if (zData) {
+          zData.companies.add(canonical.code);
+          zData.permits++;
+          if (isAnyHra) zData.hra = true;
+          if (st === 'hold' || st === 'onhold' || st === 'on-hold') zData.onHold = true;
+          if (st === 'approved' || st === 'pre-approved' || st === 'preapproved') zData.preOk++;
+
+          if (isWorkHeight) zData.hraActivities.add('Working At Height');
+          if (isHazardous) zData.hraActivities.add('Working Hazardous Substances');
+          if (isCranes) zData.hraActivities.add('Using Cranes Or Lifting');
+          if (isHotWork) zData.hraActivities.add('Hot Work');
+          if (isConfined) zData.hraActivities.add('Working Confined Spaces');
+          if (isElectrical) zData.hraActivities.add('Working On Electrical System');
+        }
+      });
+    });
+
+    const roomsToReview = Array.from(dbZoneMap.values()).map((z) => ({
+      zone: z.zone,
+      companies: Array.from(z.companies),
+      clash: z.companies.size > 1,
+      hra: z.hra,
+      hraList: Array.from(z.hraActivities),
+      hraText: Array.from(z.hraActivities).join(', '),
+      onHold: z.onHold,
+      preOk: z.preOk,
+      permits: z.permits,
+      sub: `${z.companies.size} companies | ${z.permits} permits`,
+    }));
+
+    const roomHoverData: Record<string, any> = {};
+    dbZoneMap.forEach((z, zName) => {
+      const hoverObj = z.permits > 0 ? {
+        title: zName,
+        subtitle: `Room / Area ${zName}`,
+        clash: z.companies.size > 1 ? `Clash (${z.companies.size} companies)` : 'Clear (No Clash)',
+        companies: `${z.companies.size} companies`,
+        permits: `${z.permits} permits`,
+        hra: z.hraActivities.size > 0 ? `HRA: ${Array.from(z.hraActivities).join(', ')}` : 'Non-HRA',
+      } : {
+        title: zName,
+        subtitle: `Room / Area ${zName}`,
+        clash: 'Clear (No Clash)',
+        companies: '0 companies',
+        permits: '0 permits',
+        hra: 'No Work',
+      };
+
+      roomHoverData[zName] = hoverObj;
+      const parts = zName.split(' - ');
+      if (parts.length > 1) {
+        roomHoverData[parts[parts.length - 1]] = hoverObj;
+      }
+    });
+
+    const allBuildings = await this.buildingRepo.find();
+
+    if (!targetBuildingId && rawBuilding && String(rawBuilding).trim() !== '' && String(rawBuilding).toLowerCase() !== 'all') {
+      const bObj = allBuildings.find(
+        (b) => b.building_name.toLowerCase().trim().includes(String(rawBuilding).toLowerCase().trim())
+      );
+      if (bObj) {
+        targetBuildingId = bObj.build_id;
+      }
+    }
+
+    let assignedFloors: Floor[] = [];
+    if (targetBuildingId) {
+      assignedFloors = allFloors.filter((f) => Number(f.build_id) === Number(targetBuildingId));
+    } else {
+      assignedFloors = allFloors;
+    }
+
+    const floorStatsMap = new Map<string, {
+      id: number | null;
+      name: string;
+      permits: number;
+      roomsSet: Set<string>;
+    }>();
+
+    assignedFloors.forEach((fl) => {
+      const normName = fl.floor_name.trim();
+      floorStatsMap.set(normName.toLowerCase(), {
+        id: fl.fl_id,
+        name: normName,
+        permits: 0,
+        roomsSet: new Set<string>(),
+      });
+    });
+
+    const resolveReqFloorName = (req: any): string | null => {
+      const fId = Number((req as any).Floor_Id || req.floorId);
+      if (!isNaN(fId) && fId > 0) {
+        const matched = allFloors.find((f) => Number(f.fl_id) === fId);
+        if (matched) return matched.floor_name.trim();
+      }
+      const rawRoomNos = (req as any).Room_Nos || req.roomNos || '';
+      if (rawRoomNos) {
+        const roomParts = String(rawRoomNos).split(',').map((s) => Number(s.trim())).filter((n) => !isNaN(n) && n > 0);
+        for (const rId of roomParts) {
+          const roomObj = allRooms.find((r) => Number(r.room_id) === rId);
+          if (roomObj && roomObj.fl_id) {
+            const matched = allFloors.find((f) => Number(f.fl_id) === Number(roomObj.fl_id));
+            if (matched) return matched.floor_name.trim();
+          }
+        }
+      }
+      return null;
+    };
+
+    allRequests.forEach((req) => {
+      const fName = resolveReqFloorName(req);
+      if (fName) {
+        const key = fName.toLowerCase();
+        if (!floorStatsMap.has(key)) {
+          floorStatsMap.set(key, {
+            id: null,
+            name: fName,
+            permits: 0,
+            roomsSet: new Set<string>(),
+          });
+        }
+        const fStats = floorStatsMap.get(key)!;
+        fStats.permits += 1;
+
+        const roomKey = (req as any).Room_Nos || req.roomNos || req.zone || 'General Area';
+        if (roomKey) fStats.roomsSet.add(roomKey);
+      }
+    });
+
+    const floors = Array.from(floorStatsMap.values()).map((f) => {
+      let status = 'gray';
+      if (f.permits > 5) status = 'purple';
+      else if (f.permits > 0) status = 'blue';
+
+      let dbRoomCount = 0;
+      if (f.id !== null) {
+        dbRoomCount = allRooms.filter((r) => Number(r.fl_id) === Number(f.id)).length;
+      }
+
+      return {
+        id: f.id,
+        name: f.name,
+        permits: f.permits,
+        rooms: dbRoomCount > 0 ? dbRoomCount : f.roomsSet.size,
+        status,
+      };
+    });
+
+    return {
+      companies: Array.from(companyMap.values()),
+      counts: {
+        permitTypes: {
+          commissioning: commissioning,
+          construction: construction,
+        },
+        permitStatuses: {
+          opened,
+          preApproved,
+          approved,
+          hold,
+          rejected,
+          draft,
+          cancelled,
+          closed,
+          autoCancel,
+          unknown,
+        },
+        activityRiskTypes: {
+          nonHra: nonHra,
+          hra: hra,
+          hotWork: hotWork,
+          electrical: electrical,
+          hazardousSubstances: hazardousSubstances,
+          workingAtHeight: workingAtHeight,
+          confinedSpaces: confinedSpaces,
+          excavation: excavation,
+          cranesLifting: cranesLifting,
+          pressureTesting: pressureTesting,
+        },
+      },
+      roomsToReview,
+      roomHoverData,
+      floors,
     };
   }
 }

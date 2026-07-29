@@ -35,6 +35,7 @@ export function generateLogsHtml(permitNo: string, logs: any[], images: any[]): 
     Closed: { color: "#4b5563", bg: "#f3f4f6", icon: "🔒" },
     Rejected: { color: "#dc2626", bg: "#fee2e2", icon: "❌" },
     Cancelled: { color: "#dc2626", bg: "#fee2e2", icon: "🚫" },
+    "Auto-Cancelled": { color: "#dc2626", bg: "#fee2e2", icon: "🚫" },
     Draft: { color: "#475569", bg: "#f1f5f9", icon: "📝" },
     Submitted: { color: "#0284c7", bg: "#e0f2fe", icon: "📤" },
   };
@@ -169,7 +170,7 @@ export function generateLogsHtml(permitNo: string, logs: any[], images: any[]): 
 
     .timeline-line {
       position: absolute;
-      left: 19px;
+      left: 29px;
       top: 8px;
       bottom: 8px;
       width: 2px;
@@ -252,7 +253,7 @@ export function generateLogsHtml(permitNo: string, logs: any[], images: any[]): 
     .status-Opened { color: #7c3aed; background-color: #f3e8ff; border-color: #e9d5ff; }
     .status-Closed { color: #4b5563; background-color: #f3f4f6; border-color: #e5e7eb; }
     .status-Rejected { color: #dc2626; background-color: #fee2e2; border-color: #fecaca; }
-    .status-Cancelled { color: #dc2626; background-color: #fee2e2; border-color: #fecaca; }
+    .status-Cancelled, .status-Auto-Cancelled { color: #dc2626; background-color: #fee2e2; border-color: #fecaca; }
     .status-Draft { color: #475569; background-color: #f1f5f9; border-color: #e2e8f0; }
     .status-Submitted { color: #0284c7; background-color: #e0f2fe; border-color: #bae6fd; }
     .status-default { color: #64748b; background-color: #f1f5f9; border-color: #e2e8f0; }
@@ -485,24 +486,29 @@ export function generateLogsHtml(permitNo: string, logs: any[], images: any[]): 
     <div class="timeline-line"></div>
     
     ${logs.map((log: any) => {
-      let usertype = log.user?.userType || '';
-      if (log.system === 1) {
-        usertype = 'System Auto Cancel';
-      } else {
-        const uLower = usertype.toLowerCase().trim();
-        if (uLower === 'department') usertype = 'ConM/HSE';
-        else if (uLower === 'department1') usertype = 'C&Q';
-        else if (uLower === 'subcontractor') usertype = 'Contractor';
-      }
+    let usertype = log.user?.userType || '';
+    if (log.system === 1) {
+      usertype = 'System Auto Cancel';
+    } else {
+      const uLower = usertype.toLowerCase().trim();
+      if (uLower === 'department') usertype = 'ConM/HSE';
+      else if (uLower === 'department1') usertype = 'C&Q';
+      else if (uLower === 'subcontractor') usertype = 'Contractor';
+    }
 
-      const username = log.system === 1 ? 'NA' : (log.user?.username || 'System');
-      const contractor = log.system === 1 ? 'NA' : (log.request?.subcontractor?.subContractorName || '-');
-      const compName = log.request?.companyName || '-';
+    const username = log.system === 1 ? 'System' : (log.user?.username || 'System');
+    const contractor = log.system === 1 ? 'NA' : (log.request?.subcontractor?.subContractorName || '-');
+    const compName = log.request?.companyName || '-';
 
-      const style = getTypeStyle(log.requestType);
-      const badgeClass = getStatusClass(log.requestType);
+    let reqType = log.requestType || 'Created';
+    if (log.system === 1 && reqType === 'Cancelled') {
+      reqType = 'Auto-Cancelled';
+    }
 
-      return `
+    const style = getTypeStyle(reqType);
+    const badgeClass = getStatusClass(reqType);
+
+    return `
       <div class="timeline-item">
         <!-- Timeline dot -->
         <div class="timeline-dot-wrap">
@@ -516,7 +522,7 @@ export function generateLogsHtml(permitNo: string, logs: any[], images: any[]): 
           <!-- Top row: type badge + time -->
           <div class="card-top-row">
             <span class="badge-status ${badgeClass}">
-              ${log.requestType || 'Created'}
+              ${reqType}
             </span>
             <span class="log-time">
               🕐 ${formatDateTime(log.createdTime)}
@@ -558,7 +564,7 @@ export function generateLogsHtml(permitNo: string, logs: any[], images: any[]): 
         </div>
       </div>
       `;
-    }).join('')}
+  }).join('')}
   </div>
 
   <!-- Uploaded Images Section -->
@@ -567,7 +573,21 @@ export function generateLogsHtml(permitNo: string, logs: any[], images: any[]): 
   <div class="section-title">Uploaded Check-In/Check-Out Pictures</div>
   <div class="image-grid">
     ${images.map((img: any) => {
-      const srcUrl = `/requests/uploads/request/${img.imageName}`;
+      const filename = img.imageName ? img.imageName.split('/').pop() : '';
+      let srcUrl = `/requests/${filename}`;
+      try {
+        const fs = require('fs');
+        const path = require('path');
+        const localPath = path.join(process.cwd(), './uploads/requests', filename);
+        if (fs.existsSync(localPath)) {
+          const ext = path.extname(filename).toLowerCase().replace('.', '');
+          const mime = ext === 'png' ? 'image/png' : 'image/jpeg';
+          const base64Data = fs.readFileSync(localPath, { encoding: 'base64' });
+          srcUrl = `data:${mime};base64,${base64Data}`;
+        }
+      } catch (e) {
+        // ignore and fallback
+      }
       return `
       <div class="image-card">
         <img src="${srcUrl}" alt="Check In/Out Image" onerror="this.src='https://placehold.co/220x150?text=No+Image'">
@@ -594,51 +614,7 @@ export function generateLogsHtml(permitNo: string, logs: any[], images: any[]): 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
 <script>
   function downloadPDF() {
-    const downloadBar = document.querySelector('.download-bar');
-    if (downloadBar) downloadBar.style.display = 'none';
-
-    const element = document.getElementById('root-content');
-    const originalMargin = element.style.margin;
-    const originalMaxWidth = element.style.maxWidth;
-    const originalWidth = element.style.width;
-    const originalBorderRadius = element.style.borderRadius;
-    const originalBoxShadow = element.style.boxShadow;
-    const originalBodyPadding = document.body.style.padding;
-
-    // Apply temporary layout overrides to align element to (0,0) with a fixed width matching windowWidth
-    element.style.margin = '0';
-    element.style.maxWidth = '900px';
-    element.style.width = '900px';
-    element.style.borderRadius = '0';
-    element.style.boxShadow = 'none';
-    document.body.style.padding = '0';
-
-    const name = "Permit_Logs_" + "${permitNo}".trim() + ".pdf";
-    const opt = {
-      margin: [10, 10, 10, 10],
-      filename: name,
-      image: { type: 'jpeg', quality: 0.98 },
-      html2canvas: { 
-        scale: 2, 
-        useCORS: true,
-        windowWidth: 900,
-        scrollX: 0,
-        scrollY: 0
-      },
-      jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
-      pagebreak: { mode: ['css', 'legacy'] }
-    };
-    html2pdf().set(opt).from(element).save().then(function() {
-      // Restore original page styling
-      element.style.margin = originalMargin;
-      element.style.maxWidth = originalMaxWidth;
-      element.style.width = originalWidth;
-      element.style.borderRadius = originalBorderRadius;
-      element.style.boxShadow = originalBoxShadow;
-      document.body.style.padding = originalBodyPadding;
-
-      if (downloadBar) downloadBar.style.display = 'flex';
-    });
+    window.location.href = "/requests/logs-design/${permitNo}/pdf";
   }
 </script>
 </body>

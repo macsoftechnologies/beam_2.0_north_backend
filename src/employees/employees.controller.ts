@@ -22,7 +22,7 @@ import {
   ApiBody,
 } from '@nestjs/swagger';
 import { EmployeesService } from './employees.service';
-import { CreateDepEmployeeDto, CreateEmpDto, CreateEmployeeDto, CreateSubEmployeeDto, CreateUserLogDto, DeleteEmployeeDto, EmpListByDeptDto, ReadUsernameDto, SearchEmployeeDto, UpdateDepEmployeeDto, UpdateEmpDto, UpdateEmployeeDto, UpdateSubEmployeeDto, SubContEmployeesQueryDto } from './dtos/employee.dto';
+import { CreateDepEmployeeDto, CreateEmpDto, CreateEmployeeDto, CreateSubEmployeeDto, CreateUserLogDto, DeleteEmployeeDto, EmpListByDeptDto, ReadUsernameDto, SearchEmployeeDto, UpdateDepEmployeeDto, UpdateEmpDto, UpdateEmployeeDto, UpdateSubEmployeeDto, SubContEmployeesQueryDto, LogsReportsQueryDto } from './dtos/employee.dto';
 import { PaginationQueryDto } from 'src/redis/dtos/pagination.dto';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
@@ -131,7 +131,7 @@ export class EmployeesController {
       },
     },
   })
-  getUserLogs(@Query() query: PaginationQueryDto) {
+  getUserLogs(@Query() query: LogsReportsQueryDto) {
     return this.employeeService.getUserLogs(query);
   }
 
@@ -190,7 +190,6 @@ export class EmployeesController {
   }
 
   @Post('search')
-  @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Paginated employee search' })
   @ApiBody({ type: SearchEmployeeDto })
@@ -204,6 +203,9 @@ export class EmployeesController {
       ],
     },
   })
+  @Post('search')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
   search(@Body() dto: SearchEmployeeDto, @Request() req: any) {
     return this.employeeService.search(dto, req.user?.userId);
   }
