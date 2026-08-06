@@ -16,8 +16,18 @@ import { PaginationQueryDto } from 'src/redis/dtos/pagination.dto';
 const encodePassword = (plain: string): string =>
   plain ? Buffer.from(plain).toString('base64') : '';
 
-const decodePassword = (encoded: string): string =>
-  encoded ? Buffer.from(encoded, 'base64').toString('utf8') : '';
+const decodePassword = (encoded: string): string => {
+  if (!encoded) return '';
+  try {
+    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    if (!decoded.includes('\uFFFD') && /^[\x20-\x7E]*$/.test(decoded)) {
+      return decoded;
+    }
+  } catch {
+    // Return original
+  }
+  return encoded;
+};
 
 const TTL = {
   ALL: 1000 * 60 * 5,
@@ -107,8 +117,11 @@ export class EmployeesService {
       existing.phonenumber = rawPhone ? `+${rawPhone}` : '';
     }
 
-    if (dto.password && dto.password.trim() !== '' && dto.password !== existing.password && dto.password !== decodePassword(existing.password)) {
-      existing.password = encodePassword(dto.password);
+    if (dto.password && typeof dto.password === 'string' && dto.password.trim() !== '') {
+      const raw = dto.password.trim();
+      if (!raw.includes('\uFFFD') && raw !== decodePassword(existing.password) && raw !== existing.password) {
+        existing.password = encodePassword(raw);
+      }
     }
   }
 
@@ -124,8 +137,11 @@ export class EmployeesService {
           });
         }
         if (dto.username) user.username = dto.username;
-        if (dto.password && dto.password.trim() !== '' && dto.password !== user.password && dto.password !== decodePassword(user.password)) {
-          user.password = encodePassword(dto.password);
+        if (dto.password && typeof dto.password === 'string' && dto.password.trim() !== '') {
+          const raw = dto.password.trim();
+          if (!raw.includes('\uFFFD') && raw !== decodePassword(user.password || '') && raw !== user.password) {
+            user.password = encodePassword(raw);
+          }
         }
         if (userType) user.userType = userType;
         if (dto.departId) user.typeId = dto.departId;
@@ -383,6 +399,10 @@ export class EmployeesService {
       return { statusCode: HttpStatus.NO_CONTENT, message: 'Empty Employee' };
     }
 
+    if (!dto.userType || dto.userType.trim() === '') {
+      return { statusCode: HttpStatus.BAD_REQUEST, message: 'Employee Type is required' };
+    }
+
     const employee = this.employeeRepo.create({
       ...dto,
       phonenumber: dto.phonenumber ? `+${dto.phonenumber}` : undefined,
@@ -485,6 +505,9 @@ export class EmployeesService {
 
   async update(dto: UpdateEmployeeDto): Promise<{ statusCode: HttpStatus; message: string }> {
     try {
+      if (!dto.userType || dto.userType.trim() === '') {
+        return { statusCode: HttpStatus.BAD_REQUEST, message: 'Employee Type is required' };
+      }
       const existing = await this.employeeRepo.findOne({ where: { id: dto.id } });
       if (!existing) {
         return { statusCode: HttpStatus.NOT_FOUND, message: 'Employee not found' };
