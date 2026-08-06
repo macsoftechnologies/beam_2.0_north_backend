@@ -16,8 +16,12 @@ export const multerOptions = {
     },
   }),
   fileFilter: (req, file, callback) => {
-    if (!file.mimetype.match(/\/(jpg|jpeg|pdf|doc|png|gif|bmp|webp)$/)) {
-      return callback(new Error('Unsupported or corrupt image file'), false);
+    const imageRegex = /\/(jpg|jpeg|png|gif|bmp|webp|svg\+xml|x-png)$/i;
+    const extRegex = /\.(jpg|jpeg|png|gif|bmp|webp|svg)$/i;
+    const isMimeValid = file.mimetype && imageRegex.test(file.mimetype);
+    const isExtValid = file.originalname && extRegex.test(file.originalname);
+    if (!isMimeValid && !isExtValid) {
+      return callback(new Error('Only image files are allowed for contractor logo (jpg, jpeg, png, gif, bmp, webp, svg)'), false);
     }
     callback(null, true);
   },
