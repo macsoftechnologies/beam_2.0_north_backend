@@ -1,10 +1,11 @@
-import { Controller, Get, Post, Put, Delete, Body, Param, HttpCode, Query, UseInterceptors, UploadedFile, HttpStatus, UseGuards, Request } from '@nestjs/common';
+import { Controller, Get, Post, Put, Delete, Body, Param, HttpCode, Query, UseInterceptors, UploadedFile, HttpStatus, UseGuards, Request, Res } from '@nestjs/common';
 import { SubcontractorService } from './subcontractor.service';
 import { CreateSubcontractorDto, UpdateSubcontractorDto, SubcontractorPaginationQueryDto } from './dtos/subcontractor.dto';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { diskStorage } from 'multer';
-import { extname } from 'path';
+import { extname, join } from 'path';
+import * as fs from 'fs';
 
 export const multerOptions = {
   storage: diskStorage({
@@ -42,13 +43,49 @@ export class SubcontractorController {
     }
   }
 
-  @Get(':id')
-  async findOne(@Param('id') id: string) {
+  @Get('logo/:filename')
+  async getLogo(@Param('filename') filename: string, @Res() res: any) {
     try {
-      const subcontractor = await this.subcontractorService.findOne(Number(id));
-      return subcontractor;
+      const cleanFilename = filename.split('/').pop()?.split('\\').pop() || filename;
+      const possiblePaths = [
+        join(process.cwd(), 'uploads', 'subcontractors', cleanFilename),
+        join(process.cwd(), './uploads/subcontractors', cleanFilename),
+        join(process.cwd(), 'dist', 'uploads', 'subcontractors', cleanFilename),
+      ];
+      for (const p of possiblePaths) {
+        if (fs.existsSync(p)) {
+          return res.sendFile(p);
+        }
+      }
+      return res.status(HttpStatus.NOT_FOUND).send('File not found on disk');
     } catch (error) {
-      return { statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: error.message };
+      return res.status(HttpStatus.INTERNAL_SERVER_ERROR).send(error.message);
+    }
+  }
+
+  @Get(':id')
+  async findOne(@Param('id') id: string, @Res() res: any) {
+    try {
+      // If the parameter is an image filename or non-numeric string, serve the file directly
+      if (/\.(jpg|jpeg|png|gif|bmp|webp|svg)$/i.test(id) || isNaN(Number(id))) {
+        const cleanFilename = id.split('/').pop()?.split('\\').pop() || id;
+        const possiblePaths = [
+          join(process.cwd(), 'uploads', 'subcontractors', cleanFilename),
+          join(process.cwd(), './uploads/subcontractors', cleanFilename),
+          join(process.cwd(), 'dist', 'uploads', 'subcontractors', cleanFilename),
+        ];
+        for (const p of possiblePaths) {
+          if (fs.existsSync(p)) {
+            return res.sendFile(p);
+          }
+        }
+        return res.status(HttpStatus.NOT_FOUND).send('File not found on disk');
+      }
+
+      const subcontractor = await this.subcontractorService.findOne(Number(id));
+      return res.json(subcontractor);
+    } catch (error) {
+      return res.status(HttpStatus.INTERNAL_SERVER_ERROR).json({ statusCode: HttpStatus.INTERNAL_SERVER_ERROR, message: error.message });
     }
   }
 
