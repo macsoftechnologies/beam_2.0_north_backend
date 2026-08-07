@@ -28,6 +28,41 @@ export const multerOptions = {
   },
 };
 
+function findFileOnDisk(filename: string): string | null {
+  const cleanFilename = filename.split('/').pop()?.split('\\').pop() || filename;
+
+  const possibleDirs = [
+    join(process.cwd(), 'uploads', 'subcontractors'),
+    join(process.cwd(), 'uploads'),
+    join(__dirname, '..', '..', 'uploads', 'subcontractors'),
+    join(__dirname, '..', '..', 'uploads'),
+    '/www/wwwroot/api.beam.safesiteworks.com/beam_2.0_north_backend/uploads/subcontractors',
+  ];
+
+  for (const dir of possibleDirs) {
+    if (!fs.existsSync(dir)) continue;
+
+    // 1. Exact match
+    const exactPath = join(dir, cleanFilename);
+    if (fs.existsSync(exactPath)) {
+      return exactPath;
+    }
+
+    // 2. Case-insensitive match for Linux OS
+    try {
+      const files = fs.readdirSync(dir);
+      const matched = files.find(f => f.toLowerCase() === cleanFilename.toLowerCase());
+      if (matched) {
+        return join(dir, matched);
+      }
+    } catch {
+      // ignore read errors
+    }
+  }
+
+  return null;
+}
+
 @Controller('subcontractors')
 export class SubcontractorController {
   constructor(private readonly subcontractorService: SubcontractorService) { }
@@ -46,16 +81,9 @@ export class SubcontractorController {
   @Get('logo/:filename')
   async getLogo(@Param('filename') filename: string, @Res() res: any) {
     try {
-      const cleanFilename = filename.split('/').pop()?.split('\\').pop() || filename;
-      const possiblePaths = [
-        join(process.cwd(), 'uploads', 'subcontractors', cleanFilename),
-        join(process.cwd(), './uploads/subcontractors', cleanFilename),
-        join(process.cwd(), 'dist', 'uploads', 'subcontractors', cleanFilename),
-      ];
-      for (const p of possiblePaths) {
-        if (fs.existsSync(p)) {
-          return res.sendFile(p);
-        }
+      const filePath = findFileOnDisk(filename);
+      if (filePath) {
+        return res.sendFile(filePath);
       }
       return res.status(HttpStatus.NOT_FOUND).send('File not found on disk');
     } catch (error) {
@@ -68,16 +96,9 @@ export class SubcontractorController {
     try {
       // If the parameter is an image filename or non-numeric string, serve the file directly
       if (/\.(jpg|jpeg|png|gif|bmp|webp|svg)$/i.test(id) || isNaN(Number(id))) {
-        const cleanFilename = id.split('/').pop()?.split('\\').pop() || id;
-        const possiblePaths = [
-          join(process.cwd(), 'uploads', 'subcontractors', cleanFilename),
-          join(process.cwd(), './uploads/subcontractors', cleanFilename),
-          join(process.cwd(), 'dist', 'uploads', 'subcontractors', cleanFilename),
-        ];
-        for (const p of possiblePaths) {
-          if (fs.existsSync(p)) {
-            return res.sendFile(p);
-          }
+        const filePath = findFileOnDisk(id);
+        if (filePath) {
+          return res.sendFile(filePath);
         }
         return res.status(HttpStatus.NOT_FOUND).send('File not found on disk');
       }
