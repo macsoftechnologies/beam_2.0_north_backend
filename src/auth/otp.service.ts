@@ -40,8 +40,13 @@ export class OtpService {
 
       const messagingServiceSid = this.configService.get<string>('TWILIO_MESSAGING_SERVICE_SID') || 'MGb53b30d757d11e8a4d038c1948ec8991';
 
-      // Ensure E.164 format
-      const to = '+' + String(phoneNumber).replace(/\D/g, '');
+      // Use exact phone number from DB for Twilio (converting 00 to + if needed)
+      let to = String(phoneNumber).trim();
+      if (to.startsWith('00')) {
+        to = '+' + to.slice(2);
+      } else if (!to.startsWith('+')) {
+        to = '+' + to;
+      }
 
       const message = await this.twilioClient.messages.create({
         messagingServiceSid,
