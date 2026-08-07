@@ -49,7 +49,8 @@ export class AuthController {
   @Post('send-change-password-otp')
   @UseGuards(JwtAuthGuard)
   async sendChangePasswordOtp(@Request() req) {
-    const userId = req.user?.userId || req.user?.sub || req.user?.id;
+    const rawId = req.user?.userId ?? req.user?.sub ?? req.user?.id;
+    const userId = Number(rawId);
     return this.authService.sendChangePasswordOtp(userId);
   }
 
