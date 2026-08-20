@@ -528,4 +528,31 @@ describe('RequestsService - Validation and Zone Logic', () => {
       ).rejects.toThrow(/Final approval for Construction under Commissioning permits must be done by a ConM/);
     });
   });
+
+  describe('resolveLevelFilters', () => {
+    it('should correctly resolve Ground Floor without generating generic base terms like Floor', async () => {
+      const mockFloorQb = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orWhere: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue([
+          { fl_id: 1401, floor_name: 'Ground Floor', build_id: 14 },
+        ]),
+      };
+
+      (service as any).floorRepo = {
+        findBy: jest.fn().mockResolvedValue([]),
+        find: jest.fn().mockResolvedValue([]),
+        createQueryBuilder: jest.fn().mockReturnValue(mockFloorQb),
+      };
+
+      const res = await service['resolveLevelFilters'](null, 'Ground Floor', '14');
+
+      expect(res).toBeDefined();
+      expect(res?.resolvedFloorIds).toEqual([1401]);
+      expect(res?.resolvedFloorNames).toEqual(['Ground Floor']);
+      expect(res?.rawTerms).toEqual(['Ground Floor']);
+      expect(mockFloorQb.where).toHaveBeenCalledWith('f.build_id IN (:...buildingIds)', { buildingIds: [14] });
+    });
+  });
 });
